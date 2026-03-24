@@ -6,12 +6,19 @@ import shutil
 import logging
 import requests
 import contextlib
-import cloudscraper
 import lxml.html
 from tqdm import tqdm
 from lxml import etree
 from lxml.html.clean import Cleaner
 from requests.models import Response
+
+# 替换 cloudscraper 为 curl_cffi 以解决 CloudFlare 403 问题
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+    logging.getLogger(__name__).warning("curl_cffi not installed, falling back to requests")
 
 
 from javsp.config import Cfg
@@ -40,65 +47,106 @@ def read_proxy():
 class Request():
     """作为网络请求出口并支持各个模块定制功能"""
     def __init__(self, use_scraper=False) -> None:
-        # 必须使用copy()，否则各个模块对headers的修改都将会指向本模块中定义的headers变量，导致只有最后一个对headers的修改生效
+        # 必须使用 copy()，否则各个模块对 headers 的修改都将会指向本模块中定义的 headers 变量，导致只有最后一个对 headers 的修改生效
         self.headers = headers.copy()
         self.cookies = {}
 
         self.proxies = read_proxy()
         self.timeout = Cfg().network.timeout.total_seconds()
-        if not use_scraper:
+        if not use_scraper or not HAS_CURL_CFFI:
             self.scraper = None
             self.__get = requests.get
             self.__post = requests.post
             self.__head = requests.head
         else:
-            self.scraper = cloudscraper.create_scraper()
-            self.__get = self._scraper_monitor(self.scraper.get)
-            self.__post = self._scraper_monitor(self.scraper.post)
-            self.__head = self._scraper_monitor(self.scraper.head)
+            # 使用 curl_cffi 替代 cloudscraper
+            self.scraper = curl_requests.Session()
+            # 手动同步 cookies 到 session
+            if self.cookies:
+                self.scraper.cookies.update(self.cookies)
+            self.__get = self._curl_cffi_wrapper(self.scraper.get)
+            self.__post = self._curl_cffi_wrapper(self.scraper.post)
+            self.__head = self._curl_cffi_wrapper(self.scraper.head)
 
-    def _scraper_monitor(self, func):
-        """监控cloudscraper的工作状态，遇到不支持的Challenge时尝试退回常规的requests请求"""
-        def wrapper(*args, **kw):
-            try:
-                return func(*args, **kw)
-            except Exception as e:
-                logger.debug(f"无法通过CloudFlare检测: '{e}', 尝试退回常规的requests请求")
-                if func == self.scraper.get:
-                    return requests.get(*args, **kw)
-                else:
-                    return requests.post(*args, **kw)
+    def _curl_cffi_wrapper(self, func):
+        """curl_cffi 请求方法包装器"""
+        def wrapper(url, **kwargs):
+            # 合并 headers
+            merged_headers = self.headers.copy()
+            if 'headers' in kwargs:
+                merged_headers.update(kwargs['headers'])
+            
+            # curl_cffi 特定参数
+            curl_kwargs = {
+                'impersonate': 'chrome110',  # 模拟 Chrome 110
+                'timeout': self.timeout,
+                'headers': merged_headers,
+            }
+            
+            # 处理代理
+            if self.proxies:
+                curl_kwargs['proxies'] = self.proxies
+            
+            # 更新 cookies
+            if hasattr(self, 'cookies') and self.cookies:
+                curl_kwargs['cookies'] = self.cookies
+            
+            # 合并其他参数
+            curl_kwargs.update(kwargs)
+            
+            return func(url, **curl_kwargs)
         return wrapper
 
     def get(self, url, delay_raise=False):
-        r = self.__get(url,
-                      headers=self.headers,
-                      proxies=self.proxies,
-                      cookies=self.cookies,
-                      timeout=self.timeout)
+        if self.scraper and HAS_CURL_CFFI:
+            # 更新 session cookies
+            if hasattr(self, 'cookies') and self.cookies:
+                self.scraper.cookies.update(self.cookies)
+            r = self.__get(url)
+        else:
+            r = self.__get(url,
+                          headers=self.headers,
+                          proxies=self.proxies,
+                          cookies=self.cookies,
+                          timeout=self.timeout)
         if not delay_raise:
-            r.raise_for_status()
+            if hasattr(r, 'status_code'):
+                r.raise_for_status()
         return r
 
     def post(self, url, data, delay_raise=False):
-        r = self.__post(url,
-                      data=data,
-                      headers=self.headers,
-                      proxies=self.proxies,
-                      cookies=self.cookies,
-                      timeout=self.timeout)
+        if self.scraper and HAS_CURL_CFFI:
+            # 更新 session cookies
+            if hasattr(self, 'cookies') and self.cookies:
+                self.scraper.cookies.update(self.cookies)
+            r = self.__post(url, data=data)
+        else:
+            r = self.__post(url,
+                          data=data,
+                          headers=self.headers,
+                          proxies=self.proxies,
+                          cookies=self.cookies,
+                          timeout=self.timeout)
         if not delay_raise:
-            r.raise_for_status()
+            if hasattr(r, 'status_code'):
+                r.raise_for_status()
         return r
 
     def head(self, url, delay_raise=True):
-        r = self.__head(url,
-                      headers=self.headers,
-                      proxies=self.proxies,
-                      cookies=self.cookies,
-                      timeout=self.timeout)
+        if self.scraper and HAS_CURL_CFFI:
+            # 更新 session cookies
+            if hasattr(self, 'cookies') and self.cookies:
+                self.scraper.cookies.update(self.cookies)
+            r = self.__head(url)
+        else:
+            r = self.__head(url,
+                          headers=self.headers,
+                          proxies=self.proxies,
+                          cookies=self.cookies,
+                          timeout=self.timeout)
         if not delay_raise:
-            r.raise_for_status()
+            if hasattr(r, 'status_code'):
+                r.raise_for_status()
         return r
 
     def get_html(self, url):
@@ -139,12 +187,23 @@ def request_post(url, data, cookies={}, timeout=None, delay_raise=False):
 
 
 def get_resp_text(resp: Response, encoding=None):
-    """提取Response的文本"""
+    """提取 Response 的文本"""
     if encoding:
         resp.encoding = encoding
     else:
-        resp.encoding = resp.apparent_encoding
-    return resp.text
+        # curl_cffi 返回的对象可能不具有 apparent_encoding 属性
+        if hasattr(resp, 'apparent_encoding'):
+            resp.encoding = resp.apparent_encoding
+        else:
+            resp.encoding = 'utf-8'
+    # curl_cffi 返回的对象可能不具有 text 属性，需要兼容处理
+    if hasattr(resp, 'text'):
+        return resp.text
+    elif hasattr(resp, 'content'):
+        enc = encoding or getattr(resp, 'encoding', 'utf-8')
+        return resp.content.decode(enc)
+    else:
+        return str(resp)
 
 
 def get_html(url, encoding='utf-8'):
@@ -161,10 +220,12 @@ def get_html(url, encoding='utf-8'):
 
 
 def resp2html(resp, encoding='utf-8') -> lxml.html.HtmlComment:
-    """将request返回的response转换为经lxml解析后的document"""
+    """将 request 返回的 response 转换为经 lxml 解析后的 document"""
     text = get_resp_text(resp, encoding=encoding)
     html = lxml.html.fromstring(text)
-    html.make_links_absolute(resp.url, resolve_base_href=True)
+    # curl_cffi 返回的对象可能没有 url 属性，需要兼容处理
+    resp_url = getattr(resp, 'url', None) or getattr(resp, 'real_url', str(resp))
+    html.make_links_absolute(resp_url, resolve_base_href=True)
     # html = cleaner.clean_html(html)
     if hasattr(sys, 'javsp_debug_mode'):
         lxml.html.open_in_browser(html, encoding=encoding)  # for develop and debug

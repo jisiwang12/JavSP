@@ -3,6 +3,8 @@ import os
 import re
 import logging
 
+import logger
+
 from javsp.web.base import Request, resp2html
 from javsp.web.exceptions import *
 from javsp.func import *
@@ -12,9 +14,25 @@ from javsp.datatype import MovieInfo, GenreMap
 from javsp.chromium import get_browsers_cookies
 
 
-# 初始化Request实例。使用scraper绕过CloudFlare后，需要指定网页语言，否则可能会返回其他语言网页，影响解析
+# 初始化 Request 实例。使用 scraper 绕过 CloudFlare 后，需要指定网页语言，否则可能会返回其他语言网页，影响解析
 request = Request(use_scraper=True)
 request.headers['Accept-Language'] = 'zh-CN,zh;q=0.9,zh-TW;q=0.8,en-US;q=0.7,en;q=0.6,ja;q=0.5'
+
+# 如果配置文件中提供了 javdb_cookie，则直接使用
+if Cfg().network.javdb_cookie:
+    logger.info('JavDB: 使用配置文件中的 Cookie')
+    request.cookies = {'locale': 'zh'}  # 确保 locale 设置为中文
+    # 解析配置文件中的 cookie 字符串
+    cookie_str = Cfg().network.javdb_cookie
+    if cookie_str:
+        # 解析 cookie 格式：key1=value1; key2=value2
+        for item in cookie_str.split(';'):
+            if '=' in item:
+                key, value = item.split('=', 1)
+                request.cookies[key.strip()] = value.strip()
+    # 如果使用 curl_cffi，确保同步 cookies 到 session
+    if hasattr(request, 'scraper') and request.scraper:
+        request.scraper.cookies.update(request.cookies)
 
 logger = logging.getLogger(__name__)
 genre_map = GenreMap('data/genre_javdb.csv')
@@ -42,21 +60,24 @@ def get_html_wrapper(url):
                 except Exception as e:
                     logger.warning(f"获取JavDB的登录凭据时出错({e})，你可能使用的是国内定制版等非官方Chrome系浏览器", exc_info=True)
                     cookies_pool = []
-            if len(cookies_pool) > 0:
-                item = cookies_pool.pop()
-                # 更换Cookies时需要创建新的request实例，否则cloudscraper会保留它内部第一次发起网络访问时获得的Cookies
-                request = Request(use_scraper=True)
-                request.cookies = item['cookies']
-                cookies_source = (item['profile'], item['site'])
-                logger.debug(f'未携带有效Cookies而发生重定向，尝试更换Cookies为: {cookies_source}')
-                return get_html_wrapper(url)
+                if len(cookies_pool) > 0:
+                    item = cookies_pool.pop()
+                    # 更换 Cookies 时需要创建新的 request 实例，否则 curl_cffi 会保留它内部第一次发起网络访问时获得的 Cookies
+                    request = Request(use_scraper=True)
+                    request.cookies = item['cookies']
+                    # 如果使用 curl_cffi，确保同步 cookies 到 session
+                    if hasattr(request, 'scraper') and request.scraper:
+                        request.scraper.cookies.update(request.cookies)
+                    cookies_source = (item['profile'], item['site'])
+                    logger.debug(f'未携带有效 Cookies 而发生重定向，尝试更换 Cookies 为: {cookies_source}')
+                    return get_html_wrapper(url)
+                else:
+                    raise CredentialError('JavDB: 所有浏览器Cookies均已过期')
+            elif r.history and 'pay' in r.url.split('/')[-1]:
+                raise SitePermissionError(f"JavDB: 此资源被限制为仅VIP可见: '{r.history[0].url}'")
             else:
-                raise CredentialError('JavDB: 所有浏览器Cookies均已过期')
-        elif r.history and 'pay' in r.url.split('/')[-1]:
-            raise SitePermissionError(f"JavDB: 此资源被限制为仅VIP可见: '{r.history[0].url}'")
-        else:
-            html = resp2html(r)
-            return html
+                html = resp2html(r)
+                return html
     elif r.status_code in (403, 503):
         html = resp2html(r)
         code_tag = html.xpath("//span[@class='code-label']/span")
@@ -74,9 +95,12 @@ def get_html_wrapper(url):
 
 
 def get_user_info(site, cookies):
-    """获取cookies对应的JavDB用户信息"""
+    """获取 cookies 对应的 JavDB 用户信息"""
     try:
         request.cookies = cookies
+        # 如果使用 curl_cffi，确保同步 cookies 到 session
+        if hasattr(request, 'scraper') and request.scraper:
+            request.scraper.cookies.update(request.cookies)
         html = request.get_html(f'https://{site}/users/profile')
     except Exception as e:
         logger.info('JavDB: 获取用户信息时出错')

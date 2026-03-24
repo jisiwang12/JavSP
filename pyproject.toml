@@ -13,12 +13,13 @@ format = "v{base}.{distance}"
 
 [tool.poetry.dependencies]
 python = "<3.13,>=3.10"
-cloudscraper = "1.2.71"
+# cloudscraper = "1.2.71"  # 已替换为 curl_cffi
 colorama = "0.4.4"
 pillow = "10.2.0"
 pretty-errors = "1.2.19"
 requests = "2.31.0"
 tqdm = "4.59.0"
+curl_cffi = "^0.6.0"
 # https://stackoverflow.com/questions/446209/possible-values-from-sys-platform
 pywin32 = {version = "^306", markers = "sys_platform == 'win32'"}
 pywin32-ctypes = {version = "^0.2.2", markers = "sys_platform == 'win32'"}

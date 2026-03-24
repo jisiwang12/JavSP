@@ -44,6 +44,8 @@ class Network(BaseConfig):
     retry: NonNegativeInt = 3
     timeout: Duration
     proxy_free: Dict[CrawlerID, Url]
+    # JavDB Cookie 配置，用于解决 403 问题
+    javdb_cookie: str | None = None
 
 class CrawlerSelect(BaseConfig):
     def items(self) -> List[tuple[str, list[CrawlerID]]]:

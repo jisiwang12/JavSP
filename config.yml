@@ -32,6 +32,9 @@ network:
     javbus: 'https://www.seedmm.help'
     javdb: 'https://javdb368.com'
     javlib: 'https://www.y78k.com'
+  # JavDB Cookie（可选）：当遇到403错误时，可从浏览器复制Cookie填入此处
+  # 注意：locale必须设为zh，否则JavDB返回英文页面会导致xpath解析失败
+  javdb_cookie: null
   # 网络问题导致抓取数据失败时的重试次数，通常3次就差不多了
   retry: 3
   # https://en.wikipedia.org/wiki/ISO_8601#Durations
