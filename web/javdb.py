@@ -27,39 +27,72 @@ else:
     base_url = cfg.ProxyFree.javdb
 
 
+def _load_cookies_pool():
+    """加载浏览器Cookies池，仅在首次需要时读取"""
+    global cookies_pool
+    if 'cookies_pool' not in globals():
+        try:
+            cookies_pool = get_browsers_cookies()
+        except (PermissionError, OSError) as e:
+            logger.warning(f"无法从浏览器Cookies文件获取JavDB的登录凭据({e})，可能是安全软件在保护浏览器Cookies文件", exc_info=True)
+            cookies_pool = []
+        except Exception as e:
+            logger.warning(f"获取JavDB的登录凭据时出错({e})，你可能使用的是国内定制版等非官方Chrome系浏览器", exc_info=True)
+            cookies_pool = []
+    return cookies_pool
+
+
+def _try_cookies_bypass(url):
+    """尝试使用浏览器Cookies绕过Cloudflare或登录限制，成功返回html，失败返回None"""
+    global request
+    pool = _load_cookies_pool()
+    while len(pool) > 0:
+        item = pool.pop()
+        # 更换Cookies时需要创建新的request实例，否则cloudscraper会保留它内部第一次发起网络访问时获得的Cookies
+        request = Request(use_scraper=True)
+        request.cookies = item['cookies']
+        cookies_source = (item['profile'], item['site'])
+        logger.debug(f'尝试使用浏览器Cookies绕过: {cookies_source}')
+        r = request.get(url, delay_raise=True)
+        if r.status_code == 200:
+            if r.history and '/login' in r.url:
+                # 这组Cookies也过期了，继续尝试下一组
+                logger.debug(f'{cookies_source}: Cookies已过期，跳过')
+                continue
+            html = resp2html(r)
+            return html
+        elif r.status_code in (403, 503):
+            # 这组Cookies也没能绕过，继续尝试下一组
+            logger.debug(f'{cookies_source}: 仍然被Cloudflare阻断({r.status_code})，尝试下一组Cookies')
+            continue
+        else:
+            # 非预期状态码，不再继续尝试
+            break
+    return None
+
+
 def get_html_wrapper(url):
     """包装外发的request请求并负责转换为可xpath的html，同时处理Cookies无效等问题"""
-    global request, cookies_pool
+    global request
     r = request.get(url, delay_raise=True)
     if r.status_code == 200:
         # 发生重定向可能仅仅是域名重定向，因此还要检查url以判断是否被跳转到了登录页
         if r.history and '/login' in r.url:
-            # 仅在需要时去读取Cookies
-            if 'cookies_pool' not in globals():
-                try:
-                    cookies_pool = get_browsers_cookies()
-                except (PermissionError, OSError) as e:
-                    logger.warning(f"无法从浏览器Cookies文件获取JavDB的登录凭据({e})，可能是安全软件在保护浏览器Cookies文件", exc_info=True)
-                    cookies_pool = []
-                except Exception as e:
-                    logger.warning(f"获取JavDB的登录凭据时出错({e})，你可能使用的是国内定制版等非官方Chrome系浏览器", exc_info=True)
-                    cookies_pool = []
-            if len(cookies_pool) > 0:
-                item = cookies_pool.pop()
-                # 更换Cookies时需要创建新的request实例，否则cloudscraper会保留它内部第一次发起网络访问时获得的Cookies
-                request = Request(use_scraper=True)
-                request.cookies = item['cookies']
-                cookies_source = (item['profile'], item['site'])
-                logger.debug(f'未携带有效Cookies而发生重定向，尝试更换Cookies为: {cookies_source}')
-                return get_html_wrapper(url)
-            else:
-                raise CredentialError('JavDB: 所有浏览器Cookies均已过期')
+            html = _try_cookies_bypass(url)
+            if html is not None:
+                return html
+            raise CredentialError('JavDB: 所有浏览器Cookies均已过期')
         elif r.history and 'pay' in r.url.split('/')[-1]:
             raise SitePermissionError(f"JavDB: 此资源被限制为仅VIP可见: '{r.history[0].url}'")
         else:
             html = resp2html(r)
             return html
     elif r.status_code in (403, 503):
+        # Cloudflare拦截，尝试使用浏览器Cookies绕过
+        html = _try_cookies_bypass(url)
+        if html is not None:
+            return html
+        # 所有Cookies均失败，报错
         html = resp2html(r)
         code_tag = html.xpath("//span[@class='code-label']/span")
         error_code = code_tag[0].text if code_tag else None
@@ -213,7 +246,6 @@ def parse_clean_data(movie: MovieInfo):
                 movie.cover = None
     except SiteBlocked:
         raise
-        logger.error('JavDB: 可能触发了反爬虫机制，请稍后再试')
     if movie.genre_id and (not movie.genre_id[0].startswith('fc2?')):
         movie.genre_norm = genre_map.map(movie.genre_id)
         movie.genre_id = None   # 没有别的地方需要再用到，清空genre id（表明已经完成转换）

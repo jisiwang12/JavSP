@@ -62,22 +62,22 @@ def resolve_alias(name):
 def import_crawlers(cfg):
     """按配置文件的抓取器顺序将该字段转换为抓取器的函数列表"""
     unknown_mods = []
+    # 如果启用了tokyolib，将其插入到所有爬虫列表的最前面（仅提供标题和简介）
+    use_tokyolib = cfg.Crawler.get('use_tokyolib', False)
     for typ, cfg_str in cfg.CrawlerSelect.items():
         mods = cfg_str.split(',')
+        if use_tokyolib and 'tokyolib' not in mods:
+            mods.insert(0, 'tokyolib')
         if 'airav' in mods:
             mods.sort(key=lambda x:x=='airav', reverse=cfg.Crawler.title__chinese_first)
         valid_mods = []
         for name in mods:
             try:
-                # 导入fc2fan抓取器的前提: 配置了fc2fan的本地路径
-                # if name == 'fc2fan' and (not os.path.isdir(cfg.Crawler.fc2fan_local_path)):
-                #     logger.debug('由于未配置有效的fc2fan路径，已跳过该抓取器')
-                #     continue
                 import_name = 'web.' + name
                 __import__(import_name)
-                valid_mods.append(import_name)  # 抓取器有效: 使用完整模块路径，便于程序实际使用
+                valid_mods.append(import_name)
             except ModuleNotFoundError:
-                unknown_mods.append(name)       # 抓取器无效: 仅使用模块名，便于显示
+                unknown_mods.append(name)
         cfg._sections['CrawlerSelect'][typ] = tuple(valid_mods)
     if unknown_mods:
         logger.warning('配置的抓取器无效: ' + ', '.join(unknown_mods))
@@ -220,7 +220,7 @@ def info_summary(movie: Movie, all_info: Dict[str, MovieInfo]):
                 final_info.cid = final_id
     # javdb封面有水印，优先采用其他站点的封面
     javdb_cover = getattr(all_info.get('javdb'), 'cover', None)
-    if javdb_cover is not None:
+    if javdb_cover is not None and javdb_cover in covers:
         if cfg.Crawler.ignore_javdb_cover == 'auto':
             covers.remove(javdb_cover)
             covers.append(javdb_cover)
@@ -444,53 +444,41 @@ def crop_poster_wrapper(fanart_file, poster_file, method='normal', hard_sub=Fals
 
 def RunNormalMode(all_movies):
     """普通整理模式"""
-    def check_step(result, msg='步骤错误'):
-        """检查一个整理步骤的结果，并负责更新tqdm的进度"""
-        if result:
-            inner_bar.update()
-        else:
-            raise Exception(msg + '\n')
-
-    outer_bar = tqdm(all_movies, desc='整理影片', ascii=True, leave=False)
-    total_step = 7 if cfg.Translate.engine else 6
-    return_movies = []
-    for movie in outer_bar:
+    def process_one_movie(movie):
+        """处理单部影片的完整流程，返回处理成功的movie或None"""
         try:
-            # 初始化本次循环要整理影片任务
             filenames = [os.path.split(i)[1] for i in movie.files]
             logger.info('正在整理: ' + ', '.join(filenames))
-            inner_bar = tqdm(total=total_step, desc='步骤', ascii=True, leave=False)
-            # 依次执行各个步骤
-            inner_bar.set_description(f'启动并发任务')
-            all_info = parallel_crawler(movie, inner_bar)
-            msg = f'为其配置的{len(cfg.CrawlerSelect[movie.data_src])}个抓取器均未获取到影片信息'
-            check_step(all_info, msg)
 
-            inner_bar.set_description('汇总数据')
+            all_info = parallel_crawler(movie)
+            msg = f'为其配置的{len(cfg.CrawlerSelect[movie.data_src])}个抓取器均未获取到影片信息'
+            if not all_info:
+                raise Exception(msg)
+
             has_required_keys = info_summary(movie, all_info)
-            check_step(has_required_keys)
+            if not has_required_keys:
+                raise Exception('必需字段缺失')
 
             if cfg.Translate.engine:
-                inner_bar.set_description('翻译影片信息')
                 success = translate_movie_info(movie.info)
-                check_step(success)
+                if not success:
+                    raise Exception('翻译失败')
 
             generate_names(movie)
-            check_step(movie.save_dir, '无法按命名规则生成目标文件夹')
+            if not movie.save_dir:
+                raise Exception('无法按命名规则生成目标文件夹')
             if not os.path.exists(movie.save_dir):
                 os.makedirs(movie.save_dir)
 
-            inner_bar.set_description('下载封面图片')
             if cfg.Picture.use_big_cover:
                 cover_dl = download_cover(movie.info.covers, movie.fanart_file, movie.info.big_covers)
             else:
                 cover_dl = download_cover(movie.info.covers, movie.fanart_file)
-            check_step(cover_dl, '下载封面图片失败')
+            if not cover_dl:
+                raise Exception('下载封面图片失败')
             cover, pic_path = cover_dl
-            # 确保实际下载的封面的url与即将写入到movie.info中的一致
             if cover != movie.info.cover:
                 movie.info.cover = cover
-            # 根据实际下载的封面的格式更新fanart/poster等图片的文件名
             if pic_path != movie.fanart_file:
                 movie.fanart_file = pic_path
                 actual_ext = os.path.splitext(pic_path)[1]
@@ -502,72 +490,105 @@ def RunNormalMode(all_movies):
                     movie.info.label.upper() in cfg.Picture.use_ai_crop_labels or
                     (R'\d' in cfg.Picture.use_ai_crop_labels and re.match(r'(\d{6}[-_]\d{3})', movie.info.dvdid))):
                 method = cfg.Picture.ai_engine
-                inner_bar.set_description('使用AI裁剪海报封面')
             else:
-                inner_bar.set_description('裁剪海报封面')
                 method = 'normal'
             crop_poster_wrapper(movie.fanart_file, movie.poster_file, method, movie.hard_sub, movie.uncensored)
-            check_step(True)
 
             if 'video_station' in cfg.NamingRule.media_servers:
                 postStep_videostation(movie)
             if len(movie.files) > 1 and 'universal' not in cfg.NamingRule.media_servers:
                 postStep_MultiMoviePoster(movie)
 
-            inner_bar.set_description('写入NFO')
             write_nfo(movie.info, movie.nfo_file)
-            check_step(True)
             if cfg.File.enable_file_move:
-                inner_bar.set_description('移动影片文件')
                 movie.rename_files()
-                check_step(True)
                 logger.info(f'整理完成，相关文件已保存到: {movie.save_dir}\n')
             else:
                 logger.info(f'刮削完成，相关文件已保存到: {movie.nfo_file}\n')
 
-            if movie != all_movies[-1] and cfg.Crawler.sleep_after_scraping > 0:
+            if cfg.Crawler.sleep_after_scraping > 0:
                 time.sleep(cfg.Crawler.sleep_after_scraping)
-            return_movies.append(movie)
+            return movie
         except Exception as e:
             logger.debug(e, exc_info=True)
             logger.error(f'整理失败: {e}')
-        finally:
-            inner_bar.close()
-    return return_movies
+            return None
+
+    parallel = cfg.Crawler.parallel_movies
+    if parallel <= 1:
+        # 逐个处理（保持原有进度条体验）
+        outer_bar = tqdm(all_movies, desc='整理影片', ascii=True, leave=False)
+        return_movies = []
+        for movie in outer_bar:
+            result = process_one_movie(movie)
+            if result:
+                return_movies.append(result)
+        return return_movies
+    else:
+        # 并发处理
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        return_movies = []
+        completed = 0
+        total = len(all_movies)
+        lock = threading.Lock()
+        logger.info(f'并发处理影片: {parallel} 个线程, 共 {total} 部影片')
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            future_to_movie = {executor.submit(process_one_movie, m): m for m in all_movies}
+            for future in as_completed(future_to_movie):
+                result = future.result()
+                with lock:
+                    completed += 1
+                    if result:
+                        return_movies.append(result)
+                    logger.info(f'进度: {completed}/{total}')
+        return return_movies
 
 
 def download_cover(covers, fanart_path, big_covers=[]):
-    """下载封面图片"""
-    # 优先下载高清封面
-    for url in big_covers:
+    """下载封面图片（并发尝试多个URL，使用第一个成功的）"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _try_download(url):
+        """尝试下载一个URL，成功返回(url, pic_path)，失败返回None"""
         pic_path = get_pic_path(fanart_path, url)
         for _ in range(cfg.Network.retry):
             try:
                 info = download(url, pic_path)
                 if valid_pic(pic_path):
-                    filesize = get_fmt_size(pic_path)
-                    width, height = get_pic_size(pic_path)
-                    elapsed = time.strftime("%M:%S", time.gmtime(info['elapsed']))
-                    speed = get_fmt_size(info['rate']) + '/s'
-                    logger.info(f"已下载高清封面: {width}x{height}, {filesize} [{elapsed}, {speed}]")
                     return (url, pic_path)
             except requests.exceptions.HTTPError:
-                # HTTPError通常说明猜测的高清封面地址实际不可用，因此不再重试
                 break
-    # 如果没有高清封面或高清封面下载失败
-    for url in covers:
-        pic_path = get_pic_path(fanart_path, url)
-        for _ in range(cfg.Network.retry):
-            try:
-                download(url, pic_path)
-                if valid_pic(pic_path):
-                    logger.debug(f"已下载封面: '{url}'")
-                    return (url, pic_path)
-                else:
-                    logger.debug(f"图片无效或已损坏: '{url}'，尝试更换下载地址")
-                    break
-            except Exception as e:
-                logger.debug(e, exc_info=True)
+            except Exception:
+                pass
+        return None
+
+    # 优先并发下载高清封面
+    if big_covers:
+        with ThreadPoolExecutor(max_workers=min(len(big_covers), 4)) as executor:
+            futures = {executor.submit(_try_download, url): url for url in big_covers}
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    url, pic_path = result
+                    filesize = get_fmt_size(pic_path)
+                    width, height = get_pic_size(pic_path)
+                    logger.info(f"已下载高清封面: {width}x{height}, {filesize}")
+                    # 取消其他未完成的任务
+                    for f in futures:
+                        f.cancel()
+                    return result
+
+    # 高清封面全部失败，并发尝试普通封面
+    if covers:
+        with ThreadPoolExecutor(max_workers=min(len(covers), 4)) as executor:
+            futures = {executor.submit(_try_download, url): url for url in covers}
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    for f in futures:
+                        f.cancel()
+                    return result
+
     logger.error(f"下载封面图片失败")
     logger.debug('big_covers:'+str(big_covers) + ', covers'+str(covers))
     return None

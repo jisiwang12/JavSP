@@ -237,6 +237,7 @@ def norm_int(cfg: Config):
     cfg.NamingRule.max_actress_count = max(cfg.getint('NamingRule', 'max_actress_count'), 1)
     cfg.File.ignore_video_file_less_than = int(cfg.getfloat('File', 'ignore_video_file_less_than') * 2**20)
     cfg.Crawler.sleep_after_scraping = max(cfg.getint('Crawler', 'sleep_after_scraping'), 0)
+    cfg.Crawler.parallel_movies = max(cfg.getint('Crawler', 'parallel_movies'), 1)
 
 
 def norm_tuples(cfg: Config):
@@ -263,6 +264,7 @@ def norm_boolean(cfg: Config):
             ('Crawler', 'respect_site_avid'),
             ('Crawler', 'title__remove_actor'),
             ('Crawler', 'title__chinese_first'),
+            ('Crawler', 'use_tokyolib'),
             ('Picture', 'use_big_cover'),
             ('Picture', 'use_ai_crop'),
             ('Picture', 'add_label_to_cover'),
