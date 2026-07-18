@@ -222,8 +222,14 @@ def info_summary(movie: Movie, all_info: Dict[str, MovieInfo]):
     javdb_cover = getattr(all_info.get('javdb'), 'cover', None)
     if javdb_cover is not None and javdb_cover in covers:
         if cfg.Crawler.ignore_javdb_cover == 'auto':
-            covers.remove(javdb_cover)
-            covers.append(javdb_cover)
+            # 如果有其他封面，完全移除javdb封面（避免并发下载时随机选中）
+            other_covers = [c for c in covers if c != javdb_cover]
+            if other_covers:
+                covers.remove(javdb_cover)
+            else:
+                # 没有其他封面，保留javdb封面但移到末尾
+                covers.remove(javdb_cover)
+                covers.append(javdb_cover)
         elif cfg.getboolean('Crawler', 'ignore_javdb_cover'):
             covers.remove(javdb_cover)
     setattr(final_info, 'covers', covers)

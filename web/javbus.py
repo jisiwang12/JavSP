@@ -86,6 +86,7 @@ def parse_data(movie: MovieInfo):
     # 整理数据并更新movie的相应属性
     movie.url = f'{permanent_url}/{movie.dvdid}'
     movie.dvdid = dvdid
+    movie.ori_title = title.strip()  # 保留完整日文原标题
     movie.title = title.replace(dvdid, '').strip()
     movie.cover = cover
     movie.preview_pics = preview_pics

@@ -170,7 +170,11 @@ def parse_data(movie: MovieInfo):
 
     container = html2.xpath("/html/body/section/div/div[@class='video-detail']")[0]
     info = container.xpath("//nav[@class='panel movie-panel-info']")[0]
-    title = container.xpath("h2/strong[@class='current-title']/text()")[0]
+    title_raw = container.xpath("h2/strong[@class='current-title']/text()")[0]
+    # 保留日文原标题（current-title本身就是日文）
+    movie.ori_title = title_raw.strip()
+    # 去掉标题开头的番号（如 "IPZZ-895 家中..." -> "家中..."）
+    title = re.sub(r'^[A-Za-z]+-\d+\s*', '', title_raw)
     show_orig_title = container.xpath("//a[contains(@class, 'meta-link') and not(contains(@style, 'display: none'))]")
     if show_orig_title:
         movie.ori_title = container.xpath("h2/span[@class='origin-title']/text()")[0]

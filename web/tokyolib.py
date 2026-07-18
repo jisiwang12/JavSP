@@ -68,6 +68,8 @@ def parse_data(movie: MovieInfo):
     if not title_tags:
         raise MovieNotFoundError(__name__, movie.dvdid)
     title = title_tags[0].strip()
+    # 去掉标题开头的番号（如 "IPZZ-895 家中..." -> "家中..."）
+    title = re.sub(r'^[A-Za-z]+-\d+\s*', '', title)
 
     # 提取简介（p.contents），需要还原混淆
     plot = None

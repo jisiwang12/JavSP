@@ -12,6 +12,7 @@ from web.exceptions import *
 from web.proxyfree import get_proxy_free_url
 from core.config import cfg
 from core.datatype import MovieInfo
+from core.chromium import get_browsers_cookies
 
 
 # 初始化Request实例
@@ -22,6 +23,51 @@ permanent_url = 'https://www.javlibrary.com'
 base_url = ''
 
 
+def _load_cookies_pool():
+    """加载浏览器Cookies池，仅在首次需要时读取"""
+    global cookies_pool
+    if 'cookies_pool' not in globals():
+        try:
+            cookies_pool = get_browsers_cookies()
+        except (PermissionError, OSError) as e:
+            logger.warning(f"无法从浏览器Cookies文件获取JavLib的登录凭据({e})，可能是安全软件在保护浏览器Cookies文件", exc_info=True)
+            cookies_pool = []
+        except Exception as e:
+            logger.warning(f"获取JavLib的登录凭据时出错({e})，你可能使用的是国内定制版等非官方Chrome系浏览器", exc_info=True)
+            cookies_pool = []
+    return cookies_pool
+
+
+def _try_cookies_bypass(url):
+    """尝试使用浏览器Cookies绕过Cloudflare或登录限制，成功返回html，失败返回None"""
+    global request
+    pool = _load_cookies_pool()
+    while len(pool) > 0:
+        item = pool.pop()
+        # 更换Cookies时需要创建新的request实例，否则cloudscraper会保留它内部第一次发起网络访问时获得的Cookies
+        request = Request(use_scraper=True)
+        request.cookies = item['cookies']
+        cookies_source = (item['profile'], item['site'])
+        logger.debug(f'尝试使用浏览器Cookies绕过JavLib: {cookies_source}')
+        r = request.get(url, delay_raise=True)
+        if r.status_code == 200:
+            if r.history and '/login' in r.url:
+                # 这组Cookies也过期了，继续尝试下一组
+                logger.debug(f'{cookies_source}: Cookies已过期，跳过')
+                continue
+            html = resp2html(r)
+            return html
+        elif r.status_code in (403, 503):
+            # 这组Cookies也没能绕过，继续尝试下一组
+            logger.debug(f'{cookies_source}: 仍然被Cloudflare阻断({r.status_code})，尝试下一组Cookies')
+            continue
+        else:
+            # 非预期状态码，不再继续尝试
+            logger.debug(f'{cookies_source}: 非预期状态码({r.status_code})，停止尝试')
+            break
+    return None
+
+
 def init_network_cfg():
     """设置合适的代理模式和base_url"""
     request.timeout = 5
@@ -29,20 +75,31 @@ def init_network_cfg():
     urls = [cfg.ProxyFree.javlib, permanent_url]
     if proxy_free_url and proxy_free_url not in urls:
         urls.insert(1, proxy_free_url)
-    # 使用代理容易触发IUAM保护，先尝试不使用代理访问
-    proxy_cfgs = [{}, cfg.Network.proxy] if cfg.Network.proxy else [{}]
-    for proxies in proxy_cfgs:
-        request.proxies = proxies
+    # 先尝试不使用代理访问（代理容易触发CloudFlare）
+    logger.debug('尝试不使用代理访问JavLib')
+    request.proxies = {}
+    for url in urls:
+        try:
+            resp = request.get(url, delay_raise=True)
+            if resp.status_code == 200:
+                request.timeout = cfg.Network.timeout
+                logger.debug(f'不使用代理成功访问: {url}')
+                return url
+        except Exception as e:
+            logger.debug(f"不使用代理访问失败 '{url}': {e}")
+    # 如果不使用代理失败，再尝试使用代理
+    if cfg.Network.proxy:
+        logger.debug('不使用代理失败，尝试使用代理访问JavLib')
+        request.proxies = cfg.Network.proxy
         for url in urls:
-            if proxies == {} and url == permanent_url:
-                continue
             try:
                 resp = request.get(url, delay_raise=True)
                 if resp.status_code == 200:
                     request.timeout = cfg.Network.timeout
+                    logger.debug(f'使用代理成功访问: {url}')
                     return url
             except Exception as e:
-                logger.debug(f"Fail to connect to '{url}': {e}")
+                logger.debug(f"使用代理访问失败 '{url}': {e}")
     logger.warning('无法绕开JavLib的反爬机制')
     request.timeout = cfg.Network.timeout
     return permanent_url
@@ -56,9 +113,18 @@ def parse_data(movie: MovieInfo):
         base_url = init_network_cfg()
         logger.debug(f"JavLib网络配置: {base_url}, proxy={request.proxies}")
     url = new_url = f'{base_url}/cn/vl_searchbyid.php?keyword={movie.dvdid}'
-    resp = request.get(url)
-    html = resp2html(resp)
-    if resp.history:
+    resp = request.get(url, delay_raise=True)
+    # 如果请求失败（403/503），尝试使用浏览器Cookies绕过
+    if resp.status_code in (403, 503):
+        logger.debug(f"JavLib返回{resp.status_code}，尝试使用浏览器Cookies绕过")
+        html = _try_cookies_bypass(url)
+        if html is None:
+            raise SiteBlocked(__name__, movie.dvdid)
+        # 使用Cookies绕过成功，直接解析html
+        resp = None  # 标记resp已失效
+    else:
+        html = resp2html(resp)
+    if resp and resp.history:
         if urlsplit(resp.url).netloc == urlsplit(base_url).netloc:
             # 出现301重定向通常且新老地址netloc相同时，说明搜索到了影片且只有一个结果
             new_url = resp.url
@@ -68,6 +134,18 @@ def parse_data(movie: MovieInfo):
             base_url = 'https://' + urlsplit(resp.url).netloc
             logger.warning(f"请将配置文件中的JavLib免代理地址更新为: {base_url}")
             return parse_data(movie)
+    elif not resp:
+        # 使用Cookies绕过成功，html已经是搜索结果页面
+        # 检查是否有多个搜索结果
+        video_tags = html.xpath("//div[@class='video'][@id]/a")
+        if video_tags:
+            # 有搜索结果，选择第一个匹配的
+            for tag in video_tags:
+                tag_dvdid = tag.xpath("div[@class='id']/text()")[0]
+                if tag_dvdid.upper() == movie.dvdid.upper():
+                    new_url = tag.get('href')
+                    html = request.get_html(new_url)
+                    break
     else:   # 如果有多个搜索结果则不会自动跳转，此时需要程序介入选择搜索结果
         video_tags = html.xpath("//div[@class='video'][@id]/a")
         # 通常第一部影片就是我们要找的，但是以免万一还是遍历所有搜索结果

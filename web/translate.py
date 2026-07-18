@@ -21,22 +21,34 @@ from core.datatype import MovieInfo
 logger = logging.getLogger(__name__)
 
 
+def _has_japanese(text):
+    """检测文本是否包含日文字符（平假名/片假名）"""
+    for ch in text:
+        cp = ord(ch)
+        if 0x3040 <= cp <= 0x309F or 0x30A0 <= cp <= 0x30FF:
+            return True
+    return False
+
+
 def translate_movie_info(info: MovieInfo):
     """根据配置翻译影片信息"""
-    # 翻译标题
-    if info.title and cfg.Translate.translate_title and info.ori_title is None:
-        result = translate(info.title, cfg.Translate.engine, info.actress)
-        if 'trans' in result:
-            info.ori_title = info.title
-            info.title = result['trans']
-            # 如果有的话，附加断句信息
-            if 'orig_break' in result:
-                setattr(info, 'ori_title_break', result['orig_break'])
-            if 'trans_break' in result:
-                setattr(info, 'title_break', result['trans_break'])
-        else:
-            logger.error('翻译标题时出错: ' + result['error'])
-            return False
+    # 翻译标题：如果ori_title为空，或者title仍是日文（含平假名/片假名），则需要翻译
+    if info.title and cfg.Translate.translate_title:
+        need_translate = info.ori_title is None or _has_japanese(info.title)
+        if need_translate:
+            result = translate(info.title, cfg.Translate.engine, info.actress)
+            if 'trans' in result:
+                if info.ori_title is None:
+                    info.ori_title = info.title
+                info.title = result['trans']
+                # 如果有的话，附加断句信息
+                if 'orig_break' in result:
+                    setattr(info, 'ori_title_break', result['orig_break'])
+                if 'trans_break' in result:
+                    setattr(info, 'title_break', result['trans_break'])
+            else:
+                logger.error('翻译标题时出错: ' + result['error'])
+                return False
     # 翻译简介
     if info.plot and cfg.Translate.translate_plot:
         result = translate(info.plot, cfg.Translate.engine, info.actress)
