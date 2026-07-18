@@ -108,13 +108,10 @@ def write_nfo(info: MovieInfo, nfo_file):
 
     # TODO: fileinfo 字段，看起来可以给定字幕语言和类型，留待开发
 
-    # 写入演员名。Kodi支持用thumb显示演员头像，如果能获取到演员头像也一并写入
+    # 写入演员名
     if info.actress:
         for i in info.actress:
-            if (info.actress_pics) and (i in info.actress_pics):
-                nfo.append(E.actor(E.name(i), E.thumb(info.actress_pics[i])))
-            else:
-                nfo.append(E.actor(E.name(i)))
+            nfo.append(E.actor(E.name(i)))
 
     with open(nfo_file, 'wt', encoding='utf-8') as f:
         f.write(tostring(nfo, encoding='unicode', pretty_print=True,
