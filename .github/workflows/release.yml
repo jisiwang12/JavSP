@@ -12,7 +12,9 @@ jobs:
       PYTHONIOENCODING: "utf-8"
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Clone repository
+      run: |
+        git clone --depth 1 --branch ${{ github.ref_name }} https://github.com/${{ github.repository }}.git .
 
     - name: Setup Python 3.8
       uses: actions/setup-python@v5
