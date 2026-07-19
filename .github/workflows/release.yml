@@ -1,0 +1,51 @@
+name: Build and Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Fetch tags
+      run: git fetch --prune --unshallow --tags
+
+    - name: Setup Python 3.8
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.8
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements.txt
+        python -m pip install pyinstaller
+
+    - name: Build with PyInstaller
+      run: cmd.exe /c 'make.bat'
+
+    - name: Get version
+      id: version
+      if: ${{ !cancelled() }}
+      run: |
+        echo "VERSION=$(python make\gen_ver_hook.py)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      if: ${{ !cancelled() }}
+      with:
+        name: JavSP-${{ env.VERSION }}-Windows-amd64
+        path: dist/JavSP.exe
+
+    - name: Upload to release
+      uses: softprops/action-gh-release@v2
+      if: ${{ github.event_name == 'release' && !cancelled() }}
+      with:
+        files: dist/JavSP.exe
