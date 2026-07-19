@@ -176,8 +176,8 @@ def check_update(allow_check=True, auto_update=True):
         return
     # 检查更新
     if allow_check:
-        api_url = 'https://api.github.com/repos/Yuukiy/JavSP/releases/latest'
-        release_url = 'https://github.com/Yuukiy/JavSP/releases/latest'
+        api_url = 'https://api.github.com/repos/jisiwang12/JavSP/releases/latest'
+        release_url = 'https://github.com/jisiwang12/JavSP/releases/latest'
         print('正在检查更新...', end='')
         try:
             data = request_get(api_url, timeout=3).json()
@@ -202,10 +202,8 @@ def check_update(allow_check=True, auto_update=True):
         title = f'Jav Scraper Package: {local_version} (已是最新版)'
         print_header([title])
     elif update_status == 'fail_to_check':
-        release_url_mirror = 'https://hub.fastgit.xyz/Yuukiy/JavSP/releases/latest'
         titles = [f'Jav Scraper Package: {local_version}']
-        info = ['检查更新失败，请前往以下地址查看最新版本:', '  '+release_url,
-                '如果你打不开上面的地址，也可以尝试访问镜像站点:', '  '+release_url_mirror]
+        info = ['检查更新失败，请前往以下地址查看最新版本:', '  '+release_url]
         print_header(titles, info)
     elif update_status == 'new_version':
         titles = [f'Jav Scraper Package: {local_version}']
@@ -231,8 +229,12 @@ def check_update(allow_check=True, auto_update=True):
         # 尝试自动更新
         if auto_update:
             try:
-                logger.info('尝试自动更新到新版本: ' + latest_version + " （按'Ctrl+C'取消）")
-                download_update(data)
+                print(f'是否更新到新版本 {latest_version}？(y/n): ', end='')
+                choice = input().strip().lower()
+                if choice == 'y' or choice == 'yes':
+                    download_update(data)
+                else:
+                    logger.info('用户取消更新')
             except KeyboardInterrupt:
                 logger.info('用户取消更新')
             except Exception as e:
@@ -260,9 +262,13 @@ def download_update(rel_info):
             if os.path.exists(backup_name):
                 os.remove(backup_name)
             os.rename(sys.executable, backup_name)
-            # 解压下载的zip文件
-            with zipfile.ZipFile(asset_name, 'r') as zip_ref:
-                zip_ref.extractall()
+            # 如果是zip文件则解压，否则直接替换
+            if asset_name.endswith('.zip'):
+                with zipfile.ZipFile(asset_name, 'r') as zip_ref:
+                    zip_ref.extractall()
+            else:
+                # 直接替换exe文件
+                shutil.move(asset_name, sys.executable)
             logger.info('更新完成，启动新版本程序...')
             args = [sys.executable] + sys.argv[1:]
             p = subprocess.Popen(args, start_new_session=True)
