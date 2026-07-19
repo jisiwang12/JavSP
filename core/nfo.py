@@ -32,10 +32,12 @@ def write_nfo(info: MovieInfo, nfo_file):
     # 目前没有合适的字段用于outline（一行简短的介绍），力求不在nfo中写入冗余的信息，因此不添加outline标签
     # 而且无论是Kodi还是Jellyfin中都没有找到实际显示outline的位置；tagline倒是都有发现
 
+    # 写入宣传语(outline): 配信開始日 发行日期
+    if info.publish_date:
+        nfo.append(E.outline('配信開始日 ' + info.publish_date))
+
     if info.plot:
         nfo.append(E.plot(info.plot))
-
-    # 目前没有合适的字段用于tagline（一行简短的介绍）
 
     # 并不是每个数据源都有影片的时长信息（例如airav）
     if info.duration:

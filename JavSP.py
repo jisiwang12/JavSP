@@ -176,7 +176,7 @@ def info_summary(movie: Movie, all_info: Dict[str, MovieInfo]):
     # parser直接更新了all_info中的项目，而初始all_info是按照优先级生成的，已经符合配置的优先级顺序了
     # 按照优先级取出各个爬虫获取到的信息
     attrs = [i for i in dir(final_info) if not i.startswith('_')]
-    covers, big_covers = [], []
+    covers, big_covers, preview_pics = [], [], []
     for name, data in all_info.items():
         absorbed = []
         # 遍历所有属性，如果某一属性当前值为空而爬取的数据中含有该属性，则采用爬虫的属性
@@ -190,6 +190,12 @@ def info_summary(movie: Movie, all_info: Dict[str, MovieInfo]):
             elif attr == 'big_cover':
                 if incoming and (incoming not in big_covers):
                     big_covers.append(incoming)
+                    absorbed.append(attr)
+            elif attr == 'preview_pics':
+                if incoming:
+                    for pic in incoming:
+                        if pic not in preview_pics:
+                            preview_pics.append(pic)
                     absorbed.append(attr)
             elif attr == 'uncensored':
                 if (current is None) and (incoming is not None):
@@ -239,6 +245,19 @@ def info_summary(movie: Movie, all_info: Dict[str, MovieInfo]):
         final_info.cover = covers[0]
     if big_covers:
         final_info.big_cover = big_covers[0]
+    # javdb剧照可能有水印，优先采用其他站点的剧照
+    javdb_preview_pics = getattr(all_info.get('javdb'), 'preview_pics', None)
+    if javdb_preview_pics and preview_pics:
+        other_pics = [p for p in preview_pics if p not in javdb_preview_pics]
+        if other_pics:
+            # 有其他剧照，完全移除javdb剧照
+            preview_pics = other_pics
+        else:
+            # 没有其他剧照，保留javdb剧照但移到末尾
+            javdb_only = [p for p in preview_pics if p in javdb_preview_pics]
+            non_javdb = [p for p in preview_pics if p not in javdb_preview_pics]
+            preview_pics = non_javdb + javdb_only
+    setattr(final_info, 'preview_pics', preview_pics if preview_pics else None)
     ########## 部分字段放在最后进行检查 ##########
     # 特殊的 genre
     if final_info.genre is None:
@@ -506,6 +525,11 @@ def RunNormalMode(all_movies):
                 postStep_MultiMoviePoster(movie)
 
             write_nfo(movie.info, movie.nfo_file)
+
+            # 下载剧照(backdrop)
+            if movie.info.preview_pics:
+                download_backdrops(movie)
+
             if cfg.File.enable_file_move:
                 movie.rename_files()
                 logger.info(f'整理完成，相关文件已保存到: {movie.save_dir}\n')
@@ -605,9 +629,52 @@ def get_pic_path(fanart_path, url):
     # 判断 url 是否带？后面的参数
     if '?' in pic_extend:
         pic_extend = pic_extend.split('?')[0]
-        
+
     pic_path = fanart_base + "." + pic_extend
     return pic_path
+
+
+def download_backdrops(movie):
+    """下载剧照作为Emby/Jellyfin的backdrop"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _try_download(url, output_path):
+        """尝试下载一个URL"""
+        for _ in range(cfg.Network.retry):
+            try:
+                download(url, output_path)
+                if os.path.getsize(output_path) > 0:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    preview_pics = movie.info.preview_pics
+    if not preview_pics:
+        return
+
+    # Emby/Jellyfin backdrop命名规则: fanart1.jpg, fanart2.jpg...
+    save_dir = movie.save_dir
+
+    if len(preview_pics) == 1:
+        ext = preview_pics[0].split('.')[-1].split('?')[0]
+        backdrop_path = os.path.join(save_dir, f'fanart1.{ext}')
+        if _try_download(preview_pics[0], backdrop_path):
+            logger.info(f"已下载剧照: fanart1.{ext}")
+    else:
+        downloaded = 0
+        with ThreadPoolExecutor(max_workers=min(len(preview_pics), 4)) as executor:
+            futures = {}
+            for i, url in enumerate(preview_pics):
+                ext = url.split('.')[-1].split('?')[0] if '.' in url else 'jpg'
+                backdrop_path = os.path.join(save_dir, f'fanart{i+1}.{ext}')
+                futures[executor.submit(_try_download, url, backdrop_path)] = i
+            for future in as_completed(futures):
+                if future.result():
+                    downloaded += 1
+        if downloaded > 0:
+            logger.info(f"已下载 {downloaded} 张剧照作为backdrop")
+
 
 def error_exit(success, err_info):
     """检查业务逻辑是否成功完成，如果失败则报错退出程序"""
