@@ -527,7 +527,7 @@ def RunNormalMode(all_movies):
             write_nfo(movie.info, movie.nfo_file)
 
             # 下载剧照(backdrop)
-            if movie.info.preview_pics:
+            if cfg.Picture.download_backdrops and movie.info.preview_pics:
                 download_backdrops(movie)
 
             if cfg.File.enable_file_move:

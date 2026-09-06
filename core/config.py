@@ -268,6 +268,7 @@ def norm_boolean(cfg: Config):
             ('Picture', 'use_big_cover'),
             ('Picture', 'use_ai_crop'),
             ('Picture', 'add_label_to_cover'),
+            ('Picture', 'download_backdrops'),
             ('NFO', 'add_custom_tags'),
             ('NFO', 'add_custom_genres'),
             ('Other', 'check_update'),
