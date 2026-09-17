@@ -532,6 +532,9 @@ def RunNormalMode(all_movies):
 
             if cfg.File.enable_file_move:
                 movie.rename_files()
+                for new_path in movie.new_paths:
+                    if not os.path.exists(new_path):
+                        raise Exception(f'视频文件移动后验证失败，目标文件不存在: {new_path}')
                 logger.info(f'整理完成，相关文件已保存到: {movie.save_dir}\n')
             else:
                 logger.info(f'刮削完成，相关文件已保存到: {movie.nfo_file}\n')
@@ -541,8 +544,27 @@ def RunNormalMode(all_movies):
             return movie
         except Exception as e:
             logger.debug(e, exc_info=True)
-            logger.error(f'整理失败: {e}')
+            filenames = [os.path.split(i)[1] for i in movie.files]
+            logger.error(f'整理失败 [{", ".join(filenames)}]: {e}')
+            # 清理无视频文件的目标文件夹（仅含元数据的残留目录）
+            if cfg.File.enable_file_move and movie.save_dir and os.path.isdir(movie.save_dir):
+                try:
+                    has_video = any(
+                        os.path.splitext(f)[1].lower() in cfg.File.media_ext
+                        for f in os.listdir(movie.save_dir)
+                    )
+                    if not has_video:
+                        shutil.rmtree(movie.save_dir)
+                        logger.debug(f'已清理无视频的目标文件夹: {movie.save_dir}')
+                except Exception:
+                    logger.debug(f'清理残留文件夹失败: {movie.save_dir}', exc_info=True)
             return None
+
+    # 预先计算路径长度模式，避免并行时多线程竞争修改全局配置
+    if cfg.NamingRule.calc_path_len_by_byte == 'auto' and all_movies:
+        sample_path = os.path.dirname(all_movies[0].files[0])
+        from core.file import is_remote_drive
+        cfg.NamingRule.calc_path_len_by_byte = is_remote_drive(sample_path)
 
     parallel = cfg.Crawler.parallel_movies
     if parallel <= 1:

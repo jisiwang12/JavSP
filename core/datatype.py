@@ -172,37 +172,64 @@ class Movie:
 
     def rename_files(self):
         """根据命名规则移动（重命名）影片文件"""
-        def move_file(src:str, dst:str):
+        def move_file(src: str, dst: str):
             """移动（重命名）文件并记录信息到日志"""
             abs_dst = os.path.abspath(dst)
-            # shutil.move might overwrite dst file
             if os.path.exists(abs_dst):
                 raise FileExistsError(f'File exists: {abs_dst}')
-            shutil.move(src, abs_dst)
+            if not os.path.exists(src):
+                raise FileNotFoundError(f'Source file not found: {src}')
+            src_size = os.path.getsize(src)
+            try:
+                # 原子操作：同文件系统下使用 os.rename，失败不会丢失源文件
+                os.rename(src, abs_dst)
+            except OSError:
+                # 跨文件系统：复制 -> 校验 -> 删除源文件
+                shutil.copy2(src, abs_dst)
+                dst_size = os.path.getsize(abs_dst)
+                if dst_size != src_size:
+                    os.remove(abs_dst)
+                    raise OSError(
+                        f'File copy size mismatch: {src} ({src_size}B) -> '
+                        f'{abs_dst} ({dst_size}B)')
+                os.remove(src)
             src_rel = os.path.relpath(src)
             dst_name = os.path.basename(dst)
             logger.info(f"重命名文件: '{src_rel}' -> '...{os.sep}{dst_name}'")
-            # 目前StreamHandler并未设置filter，为了避免显示中出现重复的日志，这里暂时只能用debug级别
             filemove_logger.debug(f'移动（重命名）文件: \n  原路径: "{src}"\n  新路径: "{abs_dst}"')
 
         new_paths = []
         dir = os.path.dirname(self.files[0])
-        if len(self.files) == 1:
-            fullpath = self.files[0]
-            ext = os.path.splitext(fullpath)[1]
-            newpath = os.path.join(self.save_dir, self.basename + ext)
-            move_file(fullpath, newpath)
-            new_paths.append(newpath)
-        else:
-            for i, fullpath in enumerate(self.files, start=1):
+        try:
+            if len(self.files) == 1:
+                fullpath = self.files[0]
                 ext = os.path.splitext(fullpath)[1]
-                newpath = os.path.join(self.save_dir, self.basename + f'-CD{i}' + ext)
+                newpath = os.path.join(self.save_dir, self.basename + ext)
                 move_file(fullpath, newpath)
                 new_paths.append(newpath)
+            else:
+                for i, fullpath in enumerate(self.files, start=1):
+                    ext = os.path.splitext(fullpath)[1]
+                    newpath = os.path.join(self.save_dir, self.basename + f'-CD{i}' + ext)
+                    move_file(fullpath, newpath)
+                    new_paths.append(newpath)
+        except Exception:
+            # 回滚：将已移动的文件恢复到源目录
+            for new_path in new_paths:
+                if os.path.exists(new_path):
+                    try:
+                        rollback_dst = os.path.join(dir, os.path.basename(new_path))
+                        os.rename(new_path, rollback_dst)
+                        logger.warning(f'已回滚文件: {new_path} -> {rollback_dst}')
+                    except OSError:
+                        logger.error(f'回滚文件失败: {new_path}', exc_info=True)
+            raise
         self.new_paths = new_paths
-        if len(os.listdir(dir)) == 0:
-            #如果移动文件后目录为空则删除该目录
-            os.rmdir(dir)
+        try:
+            if len(os.listdir(dir)) == 0:
+                os.rmdir(dir)
+        except OSError:
+            pass
 
 
 class GenreMap(dict):
