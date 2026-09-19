@@ -201,7 +201,8 @@ def urlretrieve(url, filename=None, reporthook=None, headers=None):
     """使用requests实现urlretrieve"""
     # https://blog.csdn.net/qq_38282706/article/details/80253447
     with contextlib.closing(requests.get(url, headers=headers,
-                                         proxies=cfg.Network.proxy, stream=True)) as r:
+                                         proxies=cfg.Network.proxy, stream=True,
+                                         timeout=cfg.Network.timeout)) as r:
         header = r.headers
         with open(filename, 'wb+') as fp:
             bs = 1024
