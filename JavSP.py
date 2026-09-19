@@ -485,9 +485,7 @@ def RunNormalMode(all_movies):
                 raise Exception('必需字段缺失')
 
             if cfg.Translate.engine:
-                success = translate_movie_info(movie.info)
-                if not success:
-                    raise Exception('翻译失败')
+                translate_movie_info(movie.info)
 
             generate_names(movie)
             if not movie.save_dir:

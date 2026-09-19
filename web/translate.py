@@ -47,8 +47,7 @@ def translate_movie_info(info: MovieInfo):
                 if 'trans_break' in result:
                     setattr(info, 'title_break', result['trans_break'])
             else:
-                logger.error('翻译标题时出错: ' + result['error'])
-                return False
+                logger.warning('翻译标题失败，保留原文: ' + result['error'])
     # 翻译简介
     if info.plot and cfg.Translate.translate_plot:
         result = translate(info.plot, cfg.Translate.engine, info.actress)
@@ -57,9 +56,7 @@ def translate_movie_info(info: MovieInfo):
             setattr(info, 'ori_plot', info.plot)
             info.plot = result['trans']
         else:
-            logger.error('翻译简介时出错: ' + result['error'])
-            return False
-    return True
+            logger.warning('翻译简介失败，保留原文: ' + result['error'])
 
 
 def translate(texts, engine='google', actress=[]):
@@ -141,6 +138,8 @@ def translate(texts, engine='google', actress=[]):
     # 如果err_msg非空，说明发生了错误，返回错误消息
     if err_msg != '':
         rtn = {'error': err_msg}
+    elif 'trans' not in rtn:
+        rtn = {'error': '{}: 未知翻译引擎或无返回结果'.format(engine)}
     return rtn
 
 
