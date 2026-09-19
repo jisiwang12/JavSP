@@ -18,17 +18,35 @@ CLI flags: `--only_scan` (identify IDs, no scrape), `--only_fetch` (re-scrape fr
 
 ## Tests
 
+### Environment setup
+
 ```bash
-pip install pytest
-pytest unittest/test_avid.py     # ID parsing
-pytest unittest/test_file.py     # file handling (uses Windows fsutil)
-pytest unittest/test_func.py     # business logic (title processing)
-pytest unittest/test_lib.py      # utility functions
-pytest unittest/test_proxyfree.py # proxy-free URL resolution
-pytest unittest/test_crawlers.py # web crawlers (hits live sites)
-pytest unittest/test_crawlers.py --only javdb  # test one crawler
-pytest unittest/test_exe.py      # built executable smoke test (requires dist/JavSP.exe)
+pip install -r requirements.txt   # project dependencies
+pip install pytest lxml_html_clean  # test runner + lxml html clean (split from lxml >= 5.x)
 ```
+
+Note: `lxml_html_clean` is required by `web/base.py` which imports `from lxml.html.clean import Cleaner`. On lxml >= 5.x this module was extracted into a separate package — without it, any test that imports from `core/` or `web/` will fail with `ImportError`.
+
+### Running tests
+
+```bash
+pytest unittest/test_avid.py      # ID parsing
+pytest unittest/test_file.py      # file handling (uses Windows fsutil)
+pytest unittest/test_func.py      # business logic (title processing)
+pytest unittest/test_lib.py       # utility functions
+pytest unittest/test_proxyfree.py # proxy-free URL resolution
+pytest unittest/test_crawlers.py  # web crawlers (hits live sites)
+pytest unittest/test_crawlers.py --only javdb  # test one crawler
+pytest unittest/test_exe.py       # built executable smoke test (requires dist/JavSP.exe)
+```
+
+Quick sanity check (offline, no network needed):
+
+```bash
+pytest unittest/test_avid.py unittest/test_func.py unittest/test_lib.py -v
+```
+
+### Notes
 
 Crawler test fixtures live in `unittest/data/` as `{avid} ({scraper}).json`. When a crawler test fails **outside CI**, `online.dump(file)` overwrites the fixture — this is intentional for keeping fixtures current.
 
