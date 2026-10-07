@@ -1,8 +1,11 @@
-"""从JavDB抓取数据"""
+"""从JavDB抓取数据：优先走App私有API，失败时回退到网页抓取"""
 import os
 import re
 import sys
+import time
+import hashlib
 import logging
+import urllib.parse
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from web.base import Request, resp2html
@@ -14,10 +17,6 @@ from core.datatype import MovieInfo, GenreMap
 from core.chromium import get_browsers_cookies
 
 
-# 初始化Request实例。使用scraper绕过CloudFlare后，需要指定网页语言，否则可能会返回其他语言网页，影响解析
-request = Request(use_scraper=True)
-request.headers['Accept-Language'] = 'zh-CN,zh;q=0.9,zh-TW;q=0.8,en-US;q=0.7,en;q=0.6,ja;q=0.5'
-
 logger = logging.getLogger(__name__)
 genre_map = GenreMap('data/genre_javdb.csv')
 permanent_url = 'https://javdb.com'
@@ -25,6 +24,195 @@ if cfg.Network.proxy:
     base_url = permanent_url
 else:
     base_url = cfg.ProxyFree.javdb
+
+
+# ---------------------------------------------------------------------------
+# App 私有 API（主路径）
+# ---------------------------------------------------------------------------
+API_BASE = 'https://jdforrepam.com/api'
+API_SECRET = (
+    '71cf27bb3c0bcdf207b64abecddc970098c7421ee7203b9cdae54478478a199e'
+    '7d5a6e1a57691123c1a931c057842fb73ba3b3c83bcd69c17ccf174081e3d8aa'
+)
+API_UA = 'Dart/3.5 (dart:io)'
+# 服务端按时间戳容忍约300秒，签名可短时复用
+_sign_cache = {'sig': None, 'ts': 0}
+
+api_request = Request()
+api_request.timeout = max(cfg.Network.timeout, 20)
+api_request.headers.update({
+    'User-Agent': API_UA,
+    'Accept-Language': 'zh-TW',
+})
+
+
+def _api_sign() -> str:
+    now = time.time()
+    if _sign_cache['sig'] and now - _sign_cache['ts'] < 240:
+        return _sign_cache['sig']
+    ts = str(int(now))
+    digest = hashlib.md5((ts + API_SECRET).encode()).hexdigest()
+    sig = f'{ts}.lpw6vgqzsp.{digest}'
+    _sign_cache.update(sig=sig, ts=now)
+    return sig
+
+
+def _fix_img(url):
+    """API返回的图片域名是负载均衡占位，替换为官方CDN"""
+    if not url:
+        return url
+    return re.sub(r'https://.*?/rhe951l4q', 'https://c0.jdbstatic.com', url)
+
+
+def _api_get(path, **params):
+    """请求私有API并返回data字段"""
+    sig = _api_sign()
+    api_request.headers['jdsignature'] = sig
+    api_request.headers['jdSignature'] = sig
+    qs = '&'.join(f'{k}={urllib.parse.quote(str(v))}' for k, v in params.items() if v is not None)
+    url = f'{API_BASE}{path}' + (f'?{qs}' if qs else '')
+    r = api_request.get(url, delay_raise=True)
+    if r.status_code == 404:
+        raise WebsiteError(f'JavDB API: 404 Not Found: {path}')
+    if r.status_code != 200:
+        raise WebsiteError(f'JavDB API: {r.status_code} 非预期状态码: {url}')
+    try:
+        body = r.json()
+    except ValueError:
+        raise WebsiteError(f'JavDB API: 响应不是JSON: {url}')
+    if not body.get('success'):
+        action = body.get('action') or ''
+        message = body.get('message') or ''
+        if action == 'JWTVerificationError':
+            raise CredentialError(f'JavDB API: 需要登录: {message}')
+        if action in ('ParameterInvalid', 'NonExistentUser'):
+            raise WebsiteError(f'JavDB API: {action}: {message}')
+        # 签名被拒/密钥失效等一律视为站点阻断，触发网页兜底
+        raise SiteBlocked(f'JavDB API: {action or "失败"}: {message or url}')
+    return body.get('data') or {}
+
+
+def _norm_code(s) -> str:
+    """归一化番号用于匹配：忽略大小写与连字符/下划线/空格"""
+    return re.sub(r'[-_\s]', '', s or '').upper()
+
+
+def _search_movie_id(dvdid: str) -> str:
+    """番号 → 影片内部id。0个匹配抛MovieNotFoundError，多个精确匹配抛MovieDuplicateError"""
+    candidates = [dvdid]
+    normalized = re.sub(r'[-_\s]', '', dvdid)
+    if normalized and normalized != dvdid:
+        candidates.append(normalized)
+    # 标题第一个空白分隔token（dvdid本身通常已是）
+    first_token = dvdid.split()[0] if dvdid.split() else ''
+    if first_token and first_token not in candidates:
+        candidates.append(first_token)
+
+    target = _norm_code(dvdid)
+    seen_ids = set()
+    matched = []
+    for q in candidates:
+        data = _api_get(
+            '/v2/search', q=q, type='movie', page=1, limit=20,
+            movie_type='all', from_recent='false',
+            movie_filter_by='all', movie_sort_by='relevance',
+        )
+        for m in data.get('movies') or []:
+            mid = m.get('id')
+            if not mid or mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            if _norm_code(m.get('number')) == target:
+                matched.append(mid)
+        if matched:
+            break
+        time.sleep(0.3)
+    if not matched:
+        raise MovieNotFoundError(__name__, dvdid)
+    if len(matched) > 1:
+        raise MovieDuplicateError(__name__, dvdid, len(matched))
+    return matched[0]
+
+
+def parse_data_api(movie: MovieInfo):
+    """通过App私有API抓取并解析指定番号的数据"""
+    movie_id = _search_movie_id(movie.dvdid)
+    time.sleep(0.3)
+    detail = _api_get(f'/v4/movies/{movie_id}').get('movie') or {}
+    if not detail:
+        raise MovieNotFoundError(__name__, movie.dvdid)
+
+    # 标题：origin_title优先作为日文原标题，title去掉番号前缀
+    title_raw = (detail.get('title') or '').strip()
+    origin_title = (detail.get('origin_title') or '').strip()
+    movie.ori_title = (origin_title or title_raw) or None
+    title = re.sub(r'^[A-Za-z]+-\d+\s*', '', title_raw or origin_title)
+    dvdid = (detail.get('number') or movie.dvdid or '').strip()
+    movie.title = title.replace(dvdid, '').strip() or None
+
+    movie.dvdid = dvdid or movie.dvdid
+    movie.url = f'{permanent_url}/v/{movie_id}'
+    movie.plot = (detail.get('summary') or '').strip() or None
+    movie.cover = _fix_img(detail.get('cover_url'))
+    movie.preview_pics = [_fix_img(p.get('large_url') or p.get('url')) for p in detail.get('preview_images') or []] or None
+    movie.preview_video = detail.get('preview_video_url') or None
+
+    # 评分：API为5分制字符串，统一换算为10分制
+    score = detail.get('score')
+    if score:
+        try:
+            movie.score = '{:.2f}'.format(float(score) * 2)
+        except ValueError:
+            pass
+
+    publish_date = (detail.get('release_date') or '').strip()
+    if publish_date and publish_date != '0000-00-00':
+        movie.publish_date = publish_date
+    duration = detail.get('duration')
+    if duration:
+        movie.duration = str(duration)
+
+    movie.director = (detail.get('director_name') or '').strip() or None
+    movie.producer = (detail.get('maker_name') or '').strip() or None
+    movie.publisher = (detail.get('publisher_name') or '').strip() or None
+    movie.serial = (detail.get('series_name') or '').strip() or None
+
+    # 标签：API返回的是展示名，无法对应网页版tag id，直接用名称做genre
+    genre = [t.get('name') for t in detail.get('tags') or [] if t.get('name')]
+    movie.genre = genre or None
+
+    # type: 0=有码类；无码/欧美等类型文档未给出取值，仅在确认有码时写False
+    if detail.get('type') == 0:
+        movie.uncensored = False
+
+    # 女优：gender 0=女 1=男
+    actress = [a.get('name') for a in detail.get('actors') or []
+               if a.get('gender') == 0 and a.get('name')]
+    movie.actress = actress or None
+
+    # 磁力：独立端点，拼装为magnet URI。失败不影响主流程
+    try:
+        time.sleep(0.3)
+        magnets = _api_get(f'/v1/movies/{movie_id}/magnets').get('magnets') or []
+    except Exception as e:
+        logger.debug(f'JavDB API: 获取磁力失败: {e}', exc_info=True)
+        magnets = []
+    links = []
+    for m in magnets:
+        h = m.get('hash')
+        if not h:
+            continue
+        name = (m.get('name') or '').replace('[javdb.com]', '')
+        links.append(f'magnet:?xt=urn:btih:{h}&dn={name}' if name else f'magnet:?xt=urn:btih:{h}')
+    movie.magnet = links or None
+
+
+# ---------------------------------------------------------------------------
+# 网页抓取（兜底路径）
+# ---------------------------------------------------------------------------
+# 初始化Request实例。使用scraper绕过CloudFlare后，需要指定网页语言，否则可能会返回其他语言网页，影响解析
+request = Request(use_scraper=True)
+request.headers['Accept-Language'] = 'zh-CN,zh;q=0.9,zh-TW;q=0.8,en-US;q=0.7,en;q=0.6,ja;q=0.5'
 
 
 def _load_cookies_pool():
@@ -137,8 +325,8 @@ def get_valid_cookies():
             logger.debug(f"{d['profile']}, {d['site']}: Cookies无效")
 
 
-def parse_data(movie: MovieInfo):
-    """从网页抓取并解析指定番号的数据
+def parse_data_web(movie: MovieInfo):
+    """从网页抓取并解析指定番号的数据（API不可用时的兜底）
     Args:
         movie (MovieInfo): 要解析的影片信息，解析后的信息直接更新到此变量内
     """
@@ -239,6 +427,22 @@ def parse_data(movie: MovieInfo):
     movie.magnet = [i.replace('[javdb.com]','') for i in magnet]
 
 
+# ---------------------------------------------------------------------------
+# 对外接口
+# ---------------------------------------------------------------------------
+def parse_data(movie: MovieInfo):
+    """从JavDB抓取并解析指定番号的数据：优先私有API，失败则回退网页抓取"""
+    try:
+        parse_data_api(movie)
+        return
+    except (MovieNotFoundError, MovieDuplicateError):
+        # 搜索无结果/结果不唯一时仍尝试网页（两边索引可能不一致）
+        logger.debug('JavDB API: 搜索未命中，回退到网页抓取')
+    except Exception as e:
+        logger.warning(f'JavDB API抓取失败，回退到网页抓取: {e}', exc_info=True)
+    parse_data_web(movie)
+
+
 def parse_clean_data(movie: MovieInfo):
     """解析指定番号的影片数据并进行清洗"""
     try:
@@ -262,7 +466,6 @@ def collect_actress_alias(type=0, use_original=True):
     use_original: 是否使用原名而非译名，True-田中レモン，False-田中檸檬
     """
     import json
-    import time
     import random
 
     actressAliasMap = {}

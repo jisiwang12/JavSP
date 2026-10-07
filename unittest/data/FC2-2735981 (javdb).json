@@ -1,26 +1,38 @@
 {
   "dvdid": "FC2-2735981",
   "cid": null,
-  "url": "https://javdb365.com/v/d25M0",
+  "url": "https://javdb.com/v/d25M0",
   "plot": null,
   "cover": null,
   "big_cover": null,
-  "genre": null,
+  "genre": [
+    "無碼",
+    "流出"
+  ],
   "genre_id": null,
   "genre_norm": null,
-  "score": "7.26",
+  "score": "7.30",
   "title": "高額寄せ集め２",
-  "ori_title": null,
-  "magnet": null,
+  "ori_title": "高額寄せ集め２",
+  "magnet": [
+    "magnet:?xt=urn:btih:fcb3e2c9abd53bc99131c69e208ff5425b3925ea&dn=FC2PPV-2735981.torrent",
+    "magnet:?xt=urn:btih:38c54222e57aa173c5fd8042e286eeb87cb7aba1&dn=FC2PPV-2735981 高額寄せ集め２.mp4",
+    "magnet:?xt=urn:btih:4cdebd0e89b7102cca646d81a7210a3c6c2dba19&dn=FC2-PPV-2735981",
+    "magnet:?xt=urn:btih:fc8d9019c1f0806aa7a959abca3f582e04f3eb3a&dn=FC2-PPV-2735981"
+  ],
   "serial": null,
-  "actress": null,
+  "actress": [
+    "Erika"
+  ],
   "actress_pics": null,
   "director": null,
-  "duration": null,
-  "producer": null,
+  "duration": "5",
+  "producer": "無印高額商品",
   "publisher": null,
   "uncensored": null,
   "publish_date": "2022-03-19",
-  "preview_pics": null,
+  "preview_pics": [
+    "https://c0.jdbstatic.com/samples/d2/d25M0_l_1.jpg"
+  ],
   "preview_video": null
 }
