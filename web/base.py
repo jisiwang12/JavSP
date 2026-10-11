@@ -114,6 +114,9 @@ def request_get(url, cookies={}, timeout=cfg.Network.timeout, delay_raise=False)
     if not delay_raise:
         if r.status_code == 403 and b'>Just a moment...<' in r.content:
             raise SiteBlocked(f"403 Forbidden: 无法通过CloudFlare检测: {url}")
+        elif r.status_code in (522, 523, 524):
+            # Cloudflare 5xx: 源站无响应/超时，重试无意义
+            raise SiteBlocked(f"{r.status_code}: 站点源站无响应，暂时无法访问: {url}")
         else:
             r.raise_for_status()
     return r
@@ -123,6 +126,8 @@ def request_post(url, data, cookies={}, timeout=cfg.Network.timeout, delay_raise
     """向指定url发送post请求"""
     r = requests.post(url, data=data, headers=headers, proxies=cfg.Network.proxy, cookies=cookies, timeout=timeout)
     if not delay_raise:
+        if r.status_code in (522, 523, 524):
+            raise SiteBlocked(f"{r.status_code}: 站点源站无响应，暂时无法访问: {url}")
         r.raise_for_status()
     return r
 

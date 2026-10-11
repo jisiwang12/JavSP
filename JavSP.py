@@ -595,9 +595,11 @@ def RunNormalMode(all_movies):
 
 
 def download_cover(covers, fanart_path, big_covers=[]):
-    """下载封面图片（并发尝试多个URL，使用第一个成功的）"""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    """按优先级顺序下载封面图片，返回第一个成功的 (url, pic_path)
 
+    covers/big_covers 的列表顺序即优先级（info_summary 会把 javdb 封面放在末尾作兜底），
+    因此必须严格按序尝试，不能并发抢跑，否则低优先级的 javdb 封面可能抢先命中。
+    """
     def _try_download(url):
         """尝试下载一个URL，成功返回(url, pic_path)，失败返回None"""
         pic_path = get_pic_path(fanart_path, url)
@@ -612,32 +614,29 @@ def download_cover(covers, fanart_path, big_covers=[]):
                 pass
         return None
 
-    # 优先并发下载高清封面
-    if big_covers:
-        with ThreadPoolExecutor(max_workers=min(len(big_covers), 4)) as executor:
-            futures = {executor.submit(_try_download, url): url for url in big_covers}
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    url, pic_path = result
-                    filesize = get_fmt_size(pic_path)
-                    width, height = get_pic_size(pic_path)
-                    logger.info(f"已下载高清封面: {width}x{height}, {filesize}")
-                    # 取消其他未完成的任务
-                    for f in futures:
-                        f.cancel()
-                    return result
+    def _download_in_order(urls):
+        """严格按 urls 的优先级顺序尝试，返回第一个成功的结果"""
+        for url in urls:
+            result = _try_download(url)
+            if result:
+                return result
+        return None
 
-    # 高清封面全部失败，并发尝试普通封面
+    # 优先下载高清封面
+    if big_covers:
+        result = _download_in_order(big_covers)
+        if result:
+            url, pic_path = result
+            filesize = get_fmt_size(pic_path)
+            width, height = get_pic_size(pic_path)
+            logger.info(f"已下载高清封面: {width}x{height}, {filesize}")
+            return result
+
+    # 高清封面全部失败，按优先级顺序尝试普通封面
     if covers:
-        with ThreadPoolExecutor(max_workers=min(len(covers), 4)) as executor:
-            futures = {executor.submit(_try_download, url): url for url in covers}
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    for f in futures:
-                        f.cancel()
-                    return result
+        result = _download_in_order(covers)
+        if result:
+            return result
 
     logger.error(f"下载封面图片失败")
     logger.debug('big_covers:'+str(big_covers) + ', covers'+str(covers))
