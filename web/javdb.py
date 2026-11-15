@@ -3,9 +3,11 @@ import os
 import re
 import sys
 import time
+import threading
 import hashlib
 import logging
 import urllib.parse
+from email.utils import parsedate_to_datetime
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from web.base import Request, resp2html
@@ -248,6 +250,96 @@ def _new_web_request(cookies=None, use_scraper=False):
 # 这样可避免 cloudscraper 携带的挑战态 Cookie 把搜索页跳转到 /login。
 request = _new_web_request(manual_cookies)
 
+# JavDB 对短时间窗内的请求数量和并发都很敏感。限流状态只作用于 JavDB 网页请求，
+# 不影响其他爬虫；串行门控可避免 parallel_movies 较高时形成请求突发。
+_WEB_MIN_INTERVAL = 3.0
+_WEB_RATE_LIMIT_ATTEMPTS = 3
+_WEB_COOLDOWN_BASE = 10.0
+_WEB_COOLDOWN_MAX = 120.0
+_web_slots = threading.BoundedSemaphore(1)
+_web_gate = threading.Lock()
+_web_next_start = 0.0
+_web_cooldown_until = 0.0
+_web_rate_limit_streak = 0
+
+
+def _parse_retry_after(value):
+    """将 Retry-After 的秒数或 HTTP 日期格式转换为等待秒数"""
+    if not value:
+        return 0.0
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        retry_at = parsedate_to_datetime(value)
+        return max(0.0, retry_at.timestamp() - time.time())
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _acquire_web_turn():
+    """获取 JavDB 网页请求槽，并按最小间隔错开请求启动时间"""
+    global _web_next_start
+    _web_slots.acquire()
+    try:
+        with _web_gate:
+            now = time.monotonic()
+            start_at = max(now, _web_next_start, _web_cooldown_until)
+            wait = start_at - now
+            _web_next_start = start_at + _WEB_MIN_INTERVAL
+        if wait > 0:
+            time.sleep(wait)
+    except BaseException:
+        _web_slots.release()
+        raise
+
+
+def _set_rate_limit_cooldown(response):
+    """记录 429 并返回本次全局冷却秒数"""
+    global _web_cooldown_until, _web_rate_limit_streak
+    with _web_gate:
+        _web_rate_limit_streak += 1
+        retry_after = _parse_retry_after(response.headers.get('Retry-After'))
+        backoff = _WEB_COOLDOWN_BASE * (2 ** (_web_rate_limit_streak - 1))
+        wait = min(max(retry_after, backoff), _WEB_COOLDOWN_MAX)
+        _web_cooldown_until = max(_web_cooldown_until, time.monotonic() + wait)
+        return wait
+
+
+def _reset_rate_limit_streak():
+    """请求成功后恢复正常冷却级别"""
+    global _web_rate_limit_streak
+    with _web_gate:
+        _web_rate_limit_streak = 0
+
+
+def _web_get(url, req=None):
+    """带 JavDB 单站点限流和 429 全局退避的 GET 请求"""
+    req = req or request
+    for attempt in range(1, _WEB_RATE_LIMIT_ATTEMPTS + 1):
+        _acquire_web_turn()
+        try:
+            r = req.get(url, delay_raise=True)
+            if r.status_code == 429:
+                wait = _set_rate_limit_cooldown(r)
+            else:
+                if r.status_code == 200:
+                    _reset_rate_limit_streak()
+        finally:
+            _web_slots.release()
+
+        if r.status_code != 429:
+            return r
+        if attempt >= _WEB_RATE_LIMIT_ATTEMPTS:
+            raise SiteBlocked(
+                f'JavDB: 429 请求过多，等待后仍未恢复，暂时跳过该站点: {url}'
+            )
+        logger.warning(
+            f'JavDB: 429 请求过多，全局暂停 {wait:.1f} 秒后重试 '
+            f'({attempt}/{_WEB_RATE_LIMIT_ATTEMPTS})'
+        )
+
 
 def _load_cookies_pool():
     """加载浏览器Cookies池，仅在首次需要时读取"""
@@ -277,7 +369,9 @@ def _try_cookies_bypass(url):
         candidate = _new_web_request(cookies, use_scraper=True)
         logger.debug(f'尝试使用Cookies绕过JavDB限制: {cookies_source}')
         try:
-            r = candidate.get(url, delay_raise=True)
+            r = _web_get(url, req=candidate)
+        except SiteBlocked:
+            raise
         except Exception as e:
             logger.debug(f'{cookies_source}: 请求失败: {e}')
             return None
@@ -314,7 +408,7 @@ def _try_cookies_bypass(url):
 def get_html_wrapper(url):
     """包装外发的request请求并负责转换为可xpath的html，同时处理Cookies无效等问题"""
     global request
-    r = request.get(url, delay_raise=True)
+    r = _web_get(url)
     if r.status_code == 200:
         # 发生重定向可能仅仅是域名重定向，因此还要检查url以判断是否被跳转到了登录页
         if urllib.parse.urlparse(r.url).path.startswith('/login'):
