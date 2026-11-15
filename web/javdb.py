@@ -26,6 +26,22 @@ else:
     base_url = cfg.ProxyFree.javdb
 
 
+def _parse_cookie_string(value):
+    """将配置中的 Cookie 请求头解析为 requests 使用的字典"""
+    value = (value or '').strip()
+    if value.lower().startswith('cookie:'):
+        value = value.split(':', 1)[1].strip()
+    cookies = {}
+    for item in value.split(';'):
+        name, sep, cookie_value = item.strip().partition('=')
+        if sep and name.strip():
+            cookies[name.strip()] = cookie_value.strip().strip('"')
+    return cookies
+
+
+manual_cookies = _parse_cookie_string(cfg.Crawler.get('javdb_cookie', ''))
+
+
 # ---------------------------------------------------------------------------
 # App 私有 API（主路径）
 # ---------------------------------------------------------------------------
@@ -37,6 +53,8 @@ API_SECRET = (
 API_UA = 'Dart/3.5 (dart:io)'
 # 服务端按时间戳容忍约300秒，签名可短时复用
 _sign_cache = {'sig': None, 'ts': 0}
+# 匿名 API 已被 JavDB 收紧为登录鉴权；同一进程内避免为每部影片重复试探
+_api_login_required_until = 0
 
 api_request = Request()
 api_request.timeout = max(cfg.Network.timeout, 20)
@@ -44,6 +62,7 @@ api_request.headers.update({
     'User-Agent': API_UA,
     'Accept-Language': 'zh-TW',
 })
+api_request.cookies = manual_cookies.copy()
 
 
 def _api_sign() -> str:
@@ -66,6 +85,9 @@ def _fix_img(url):
 
 def _api_get(path, **params):
     """请求私有API并返回data字段"""
+    global _api_login_required_until
+    if time.time() < _api_login_required_until:
+        raise CredentialError('JavDB API: 需要登录')
     sig = _api_sign()
     api_request.headers['jdsignature'] = sig
     api_request.headers['jdSignature'] = sig
@@ -84,6 +106,7 @@ def _api_get(path, **params):
         action = body.get('action') or ''
         message = body.get('message') or ''
         if action == 'JWTVerificationError':
+            _api_login_required_until = time.time() + 6 * 60 * 60
             raise CredentialError(f'JavDB API: 需要登录: {message}')
         if action in ('ParameterInvalid', 'NonExistentUser'):
             raise WebsiteError(f'JavDB API: {action}: {message}')
@@ -210,9 +233,20 @@ def parse_data_api(movie: MovieInfo):
 # ---------------------------------------------------------------------------
 # 网页抓取（兜底路径）
 # ---------------------------------------------------------------------------
-# 初始化Request实例。使用scraper绕过CloudFlare后，需要指定网页语言，否则可能会返回其他语言网页，影响解析
-request = Request(use_scraper=True)
-request.headers['Accept-Language'] = 'zh-CN,zh;q=0.9,zh-TW;q=0.8,en-US;q=0.7,en;q=0.6,ja;q=0.5'
+_web_accept_language = 'zh-CN,zh;q=0.9,zh-TW;q=0.8,en-US;q=0.7,en;q=0.6,ja;q=0.5'
+
+
+def _new_web_request(cookies=None, use_scraper=False):
+    """创建带统一语言和 Cookie 的网页请求实例"""
+    req = Request(use_scraper=use_scraper)
+    req.headers['Accept-Language'] = _web_accept_language
+    req.cookies = dict(cookies or {})
+    return req
+
+
+# 普通 requests 通常已能访问 javdb.com；遇到 Cloudflare 403 时再切到 cloudscraper。
+# 这样可避免 cloudscraper 携带的挑战态 Cookie 把搜索页跳转到 /login。
+request = _new_web_request(manual_cookies)
 
 
 def _load_cookies_pool():
@@ -222,7 +256,12 @@ def _load_cookies_pool():
         try:
             cookies_pool = get_browsers_cookies()
         except (PermissionError, OSError) as e:
-            logger.warning(f"无法从浏览器Cookies文件获取JavDB的登录凭据({e})，可能是安全软件在保护浏览器Cookies文件", exc_info=True)
+            logger.warning(
+                f"无法从浏览器Cookies文件获取JavDB的登录凭据({e})。"
+                "如果 Chrome/Edge 正在运行，请关闭浏览器后重试，或在 "
+                "config.ini 的 [Crawler] javdb_cookie 中手工填写 Cookie",
+                exc_info=True,
+            )
             cookies_pool = []
         except Exception as e:
             logger.warning(f"获取JavDB的登录凭据时出错({e})，你可能使用的是国内定制版等非官方Chrome系浏览器", exc_info=True)
@@ -233,29 +272,42 @@ def _load_cookies_pool():
 def _try_cookies_bypass(url):
     """尝试使用浏览器Cookies绕过Cloudflare或登录限制，成功返回html，失败返回None"""
     global request
-    pool = _load_cookies_pool()
-    while len(pool) > 0:
-        item = pool.pop()
+    def try_candidate(cookies_source, cookies):
         # 更换Cookies时需要创建新的request实例，否则cloudscraper会保留它内部第一次发起网络访问时获得的Cookies
-        request = Request(use_scraper=True)
-        request.cookies = item['cookies']
-        cookies_source = (item['profile'], item['site'])
-        logger.debug(f'尝试使用浏览器Cookies绕过: {cookies_source}')
-        r = request.get(url, delay_raise=True)
+        candidate = _new_web_request(cookies, use_scraper=True)
+        logger.debug(f'尝试使用Cookies绕过JavDB限制: {cookies_source}')
+        try:
+            r = candidate.get(url, delay_raise=True)
+        except Exception as e:
+            logger.debug(f'{cookies_source}: 请求失败: {e}')
+            return None
         if r.status_code == 200:
-            if r.history and '/login' in r.url:
+            if urllib.parse.urlparse(r.url).path.startswith('/login'):
                 # 这组Cookies也过期了，继续尝试下一组
                 logger.debug(f'{cookies_source}: Cookies已过期，跳过')
-                continue
+                return None
             html = resp2html(r)
-            return html
+            return candidate, html
         elif r.status_code in (403, 503):
             # 这组Cookies也没能绕过，继续尝试下一组
             logger.debug(f'{cookies_source}: 仍然被Cloudflare阻断({r.status_code})，尝试下一组Cookies')
-            continue
+            return None
         else:
             # 非预期状态码，不再继续尝试
-            break
+            return None
+
+    result = try_candidate('config.ini', manual_cookies) if manual_cookies else None
+    if result is not None:
+        request, html = result
+        return html
+
+    pool = _load_cookies_pool()
+    for item in reversed(pool):
+        cookies_source = (item['profile'], item['site'])
+        result = try_candidate(cookies_source, item['cookies'])
+        if result is not None:
+            request, html = result
+            return html
     return None
 
 
@@ -265,11 +317,15 @@ def get_html_wrapper(url):
     r = request.get(url, delay_raise=True)
     if r.status_code == 200:
         # 发生重定向可能仅仅是域名重定向，因此还要检查url以判断是否被跳转到了登录页
-        if r.history and '/login' in r.url:
+        if urllib.parse.urlparse(r.url).path.startswith('/login'):
             html = _try_cookies_bypass(url)
             if html is not None:
                 return html
-            raise CredentialError('JavDB: 所有浏览器Cookies均已过期')
+            raise CredentialError(
+                'JavDB: 搜索和影片资料现在需要登录。请在 config.ini 的 '
+                '[Crawler] javdb_cookie 中填入 javdb.com 的完整 Cookie'
+                '（至少包含 _jdb_session）；也可关闭 Chrome/Edge 后重试自动读取'
+            )
         elif r.history and 'pay' in r.url.split('/')[-1]:
             raise SitePermissionError(f"JavDB: 此资源被限制为仅VIP可见: '{r.history[0].url}'")
         else:
@@ -281,6 +337,11 @@ def get_html_wrapper(url):
         if html is not None:
             return html
         # 所有Cookies均失败，报错
+        if not r.content:
+            raise SiteBlocked(
+                f'JavDB: {r.status_code} 禁止访问: {url} '
+                '（站点返回空响应，请更换代理节点后重试）'
+            )
         html = resp2html(r)
         code_tag = html.xpath("//span[@class='code-label']/span")
         error_code = code_tag[0].text if code_tag else None
@@ -317,12 +378,30 @@ def get_user_info(site, cookies):
 def get_valid_cookies():
     """扫描浏览器，获取一个可用的Cookies"""
     # 经测试，Cookies所发往的域名不需要和登录时的域名保持一致，只要Cookies有效即可在多个域名间使用
-    for d in cookies_pool:
+    for d in _load_cookies_pool():
         info = get_user_info(d['site'], d['cookies'])
         if info:
             return d['cookies']
         else:
             logger.debug(f"{d['profile']}, {d['site']}: Cookies无效")
+
+
+def _info_field(info, *labels):
+    """读取详情面板字段，兼容 JavDB 的简体和繁体界面"""
+    for label in labels:
+        tags = info.xpath(".//strong[text()=$label]", label=label)
+        if tags:
+            return tags[0].getparent()
+    return None
+
+
+def _info_value(info, *labels):
+    """读取详情面板字段的文本值"""
+    field = _info_field(info, *labels)
+    if field is None:
+        return None
+    values = field.xpath(".//span[@class='value']")
+    return values[0].text_content().strip() if values else None
 
 
 def parse_data_web(movie: MovieInfo):
@@ -331,7 +410,8 @@ def parse_data_web(movie: MovieInfo):
         movie (MovieInfo): 要解析的影片信息，解析后的信息直接更新到此变量内
     """
     # JavDB搜索番号时会有多个搜索结果，从中查找匹配番号的那个
-    html = get_html_wrapper(f'{base_url}/search?q={movie.dvdid}')
+    query = urllib.parse.quote(movie.dvdid)
+    html = get_html_wrapper(f'{base_url}/search?q={query}')
     ids = list(map(str.lower, html.xpath("//div[@class='video-title']/strong/text()")))
     movie_urls = html.xpath("//a[@class='box']/@href")
     match_count = len([i for i in ids if i == movie.dvdid.lower()])
@@ -375,44 +455,58 @@ def parse_data_web(movie: MovieInfo):
             preview_video = 'https:' + preview_video
         movie.preview_video = preview_video
     dvdid = info.xpath("div/span")[0].text_content()
-    publish_date = info.xpath("div/strong[text()='日期:']")[0].getnext().text
-    duration = info.xpath("div/strong[text()='時長:']")[0].getnext().text.replace('分鍾', '').strip()
-    director_tag = info.xpath("div/strong[text()='導演:']")
-    if director_tag:
-        movie.director = director_tag[0].getnext().text_content().strip()
+    publish_date = _info_value(info, '日期:')
+    duration = _info_value(info, '时长:', '時長:')
+    if duration:
+        duration = re.sub(r'\s*(?:分钟|分鐘|分鍾)$', '', duration).strip()
+    movie.director = _info_value(info, '导演:', '導演:')
     av_type = guess_av_type(movie.dvdid)
     if av_type != 'fc2':
-        producer_tag = info.xpath("div/strong[text()='片商:']")
+        movie.producer = _info_value(info, '片商:')
     else:
-        producer_tag = info.xpath("div/strong[text()='賣家:']")
-    if producer_tag:
-        movie.producer = producer_tag[0].getnext().text_content().strip()
-    publisher_tag = info.xpath("div/strong[text()='發行:']")
-    if publisher_tag:
-        movie.publisher = publisher_tag[0].getnext().text_content().strip()
-    serial_tag = info.xpath("div/strong[text()='系列:']")
-    if serial_tag:
-        movie.serial = serial_tag[0].getnext().text_content().strip()
-    score_tag = info.xpath("//span[@class='score-stars']")
-    if score_tag:
-        score_str = score_tag[0].tail
-        score = re.search(r'([\d.]+)分', score_str).group(1)
+        movie.producer = _info_value(info, '卖家:', '賣家:')
+    movie.publisher = _info_value(info, '发行:', '發行:')
+    movie.serial = _info_value(info, '系列:')
+    score_value = _info_value(info, '评分:', '評分:')
+    if score_value:
+        score_match = re.search(r'([\d.]+)分', score_value)
+    else:
+        score_tag = info.xpath("//span[@class='score-stars']")
+        score_str = score_tag[0].tail if score_tag else None
+        score_match = re.search(r'([\d.]+)分', score_str or '')
+    if score_match:
+        score = score_match.group(1)
         movie.score = "{:.2f}".format(float(score)*2)
-    genre_tags = info.xpath("//strong[text()='類別:']/../span/a")
+    genre_field = _info_field(info, '类别:', '類別:')
+    genre_tags = genre_field.xpath(".//span[@class='value']/a") if genre_field is not None else []
     genre, genre_id = [], []
     for tag in genre_tags:
-        pre_id = tag.get('href').split('/')[-1]
+        href = tag.get('href') or ''
+        pre_id = urllib.parse.urlsplit(href).path.split('/')[-1]
+        query = urllib.parse.urlsplit(href).query
+        if query:
+            pre_id += '?' + query
         genre.append(tag.text)
         genre_id.append(pre_id)
         # 判定影片有码/无码
         subsite = pre_id.split('?')[0]
-        movie.uncensored = {'uncensored': True, 'tags':False}.get(subsite)
-    # JavDB目前同时提供男女优信息，根据用来标识性别的符号筛选出女优
-    actors_tag = info.xpath("//strong[text()='演員:']/../span")[0]
-    all_actors = actors_tag.xpath("a/text()")
-    genders = actors_tag.xpath("strong/text()")
-    actress = [i for i in all_actors if genders[all_actors.index(i)] == '♀']
-    magnet = container.xpath("//div[@class='magnet-name column is-four-fifths']/a/@href")
+        movie.uncensored = {'uncensored': True, 'tags': False}.get(subsite)
+    # 新页面直接给女优链接加 actor-female 类；旧页面用 ♀ 符号标识
+    actor_field = _info_field(info, '演员:', '演員:')
+    actress = []
+    if actor_field is not None:
+        actress = actor_field.xpath(".//a[contains(concat(' ', normalize-space(@class), ' '), ' actor-female ')]/text()")
+        if not actress:
+            actors_tag = actor_field.xpath(".//span[@class='value']")
+            if actors_tag:
+                all_actors = actors_tag[0].xpath("a/text()")
+                genders = actors_tag[0].xpath("strong/text()")
+                actress = [name for i, name in enumerate(all_actors)
+                           if i < len(genders) and genders[i] == '♀']
+    magnet = container.xpath(
+        ".//div[contains(concat(' ', normalize-space(@class), ' '), ' magnet-name ')]"
+        "//a[starts-with(@href, 'magnet:')]/@href"
+    )
 
     movie.dvdid = dvdid
     movie.url = new_url.replace(base_url, permanent_url)
@@ -438,6 +532,8 @@ def parse_data(movie: MovieInfo):
     except (MovieNotFoundError, MovieDuplicateError):
         # 搜索无结果/结果不唯一时仍尝试网页（两边索引可能不一致）
         logger.debug('JavDB API: 搜索未命中，回退到网页抓取')
+    except CredentialError:
+        logger.debug('JavDB API: 需要登录，回退到网页抓取')
     except Exception as e:
         logger.warning(f'JavDB API抓取失败，回退到网页抓取: {e}', exc_info=True)
     parse_data_web(movie)

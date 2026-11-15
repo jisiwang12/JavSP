@@ -5,6 +5,7 @@ import json
 import base64
 import sqlite3
 import logging
+import tempfile
 from glob import glob
 from shutil import copyfile
 from datetime import datetime
@@ -112,28 +113,33 @@ decrypt_key = decrypt_key_win if sys.platform == 'win32' else decrypt_key_linux
 
 def get_cookies(cookies_file, decrypter, host_pattern='javdb%.com'):
     """从cookies_file文件中查找指定站点的所有Cookies"""
-    # 复制Cookies文件到临时目录，避免直接操作原始的Cookies文件
-    temp_dir = os.getenv('TMPDIR', os.getenv('TEMP', os.getenv('TMP', '.')))
-    temp_cookie = os.path.join(temp_dir, 'Cookies')
-    copyfile(cookies_file, temp_cookie)
-    # 连接数据库进行查询
-    conn = sqlite3.connect(temp_cookie)
-    cursor = conn.cursor()
-    cursor.execute(f'SELECT host_key, name, encrypted_value, expires_utc FROM cookies WHERE host_key LIKE "{host_pattern}"')
-    # 将查询结果按照host_key进行组织
-    now = datetime.now()
-    records = {}
-    for host_key, name, encrypted_value, expires_utc in cursor.fetchall():
-        d = records.setdefault(host_key, {})
-        # 只提取尚在有效期内的Cookies
-        expires = convert_chrome_utc(expires_utc)
-        if expires > now:
-            d[name] = decrypter.decrypt(encrypted_value)
-    # Cookies的核心字段是'_jdb_session'，因此如果records中缺失此字段（说明已过期），则对应的Cookies不再有效
-    valid_records = {k: v for k, v in records.items() if '_jdb_session' in v}
-    conn.close()
-    os.remove(temp_cookie)
-    return valid_records
+    # 每次使用独立临时文件，避免多个浏览器/进程互相覆盖或留下旧数据库
+    fd, temp_cookie = tempfile.mkstemp(prefix='javsp-cookies-', suffix='.sqlite')
+    os.close(fd)
+    conn = None
+    try:
+        copyfile(cookies_file, temp_cookie)
+        conn = sqlite3.connect(temp_cookie)
+        cursor = conn.cursor()
+        cursor.execute(
+            f'SELECT host_key, name, encrypted_value, expires_utc '
+            f'FROM cookies WHERE host_key LIKE "{host_pattern}"'
+        )
+        # 将查询结果按照host_key进行组织
+        now = datetime.now()
+        records = {}
+        for host_key, name, encrypted_value, expires_utc in cursor.fetchall():
+            d = records.setdefault(host_key, {})
+            # 只提取尚在有效期内的Cookies
+            expires = convert_chrome_utc(expires_utc)
+            if expires > now:
+                d[name] = decrypter.decrypt(encrypted_value)
+        # Cookies的核心字段是'_jdb_session'，缺失时说明对应的Cookies不再有效
+        return {k: v for k, v in records.items() if '_jdb_session' in v}
+    finally:
+        if conn is not None:
+            conn.close()
+        os.remove(temp_cookie)
 
 
 if __name__ == "__main__":
